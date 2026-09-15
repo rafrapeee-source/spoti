@@ -210,21 +210,158 @@ function parseNext(data, videoId) {
   ]).filter((t) => t.id !== videoId);
 }
 
-// "Radio": songs similar to videoId (same artist / genre) — the equivalent of Spotify's autoplay.
-// Sources are tried in order because YouTube sometimes rejects one of them from cloud servers:
-// the YouTube Mix, YouTube Music's song radio, related videos, then a search for the artist.
-const RADIO_TIMEOUT = 6000;
+const cachedSearch = (q) => cached(`s:${q}:`, () => search(q));
+
+/* ---------------- matching helpers ---------------- */
+
+// Covers, karaoke, remixes, live recordings… never what autoplay should pick.
+const VARIANT =
+  /\b(cover|karaoke|instrumental|reaction|remix|slowed|sped[ -]?up|reverb|8d|nightcore|tutorial|lesson|chords|mashup|live (at|from|in|on)|live performance)\b/i;
+
+const norm = (s) => String(s || '').toLowerCase().normalize('NFKD').replace(/[^\p{L}\p{N}]/gu, '');
+const stripExtras = (s) =>
+  String(s || '')
+    .replace(/\s*[([].*?[)\]]/g, '')
+    .replace(/\s+(ft\.?|feat\.?|featuring)\s.*$/i, '')
+    .trim();
+const songKey = (title) => norm(stripExtras(title));
+
+function sameSong(track, seed) {
+  const key = songKey(seed.title);
+  if (key.length < 3) return false;
+  return songKey(track.title) === key || (key.length >= 6 && norm(track.rawTitle).includes(key));
+}
+
+function shuffled(list) {
+  const a = [...list];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+async function mapLimit(items, limit, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i], i);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
+}
+
+// Picks the official upload of a song from YouTube search results, skipping covers and live versions.
+async function findOnYouTube(artist, title) {
+  const artistKey = norm(artist);
+  const titleKey = songKey(title);
+  if (!artistKey || !titleKey) return null;
+  const { tracks } = await cachedSearch(`${artist} ${stripExtras(title)}`);
+  let best = null;
+  let bestScore = 0;
+  for (const t of tracks.slice(0, 6)) {
+    const raw = norm(t.rawTitle);
+    if (!raw.includes(titleKey)) continue;
+    let score = 3;
+    if (norm(t.channel).includes(artistKey) || raw.includes(artistKey)) score += 2;
+    if (/ - Topic$|VEVO$/i.test(t.channel)) score += 1;
+    if (/official/i.test(t.rawTitle)) score += 1;
+    if (VARIANT.test(t.rawTitle)) score -= 4;
+    if (t.duration < 60 || t.duration > 600) score -= 4;
+    if (score > bestScore) {
+      best = t;
+      bestScore = score;
+    }
+  }
+  return best && { ...best, title, artist };
+}
+
+/* ---------------- similar artists (Deezer public API, no key needed) ---------------- */
+
+async function deezer(pathAndQuery) {
+  const res = await fetch(`https://api.deezer.com${pathAndQuery}`, {
+    headers: { 'User-Agent': USER_AGENT },
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!res.ok) throw new Error(`deezer HTTP ${res.status}`);
+  const data = await res.json();
+  if (data?.error) throw new Error(`deezer: ${data.error.message || data.error.type || 'error'}`);
+  return data;
+}
+const deezerCached = (pathAndQuery) => cached(`dz:${pathAndQuery}`, () => deezer(pathAndQuery));
+
+async function findOnDeezer(seed) {
+  const artist = stripExtras(seed.artist);
+  const title = stripExtras(seed.title);
+  const artistKey = norm(artist);
+  for (const q of new Set([`${artist} ${title}`.trim(), title])) {
+    if (!q) continue;
+    const { data = [] } = await deezerCached(`/search?limit=10&q=${encodeURIComponent(q)}`);
+    const byArtist = data.find((t) => {
+      const a = norm(t.artist?.name);
+      return artistKey && a && (a.includes(artistKey) || artistKey.includes(a));
+    });
+    if (byArtist || data[0]) return byArtist || data[0];
+  }
+  return null;
+}
+
+// Spotify-style radio: one song from each of ten similar artists, with the seed artist's
+// other hits mixed in every third song, each matched to its official upload on YouTube.
+async function similarSongs(seed, videoId) {
+  const found = await findOnDeezer(seed);
+  const artistId = found?.artist?.id;
+  if (!artistId) throw new Error('song not found on Deezer');
+
+  const [related, own] = await Promise.all([
+    deezerCached(`/artist/${artistId}/related?limit=20`).then((r) => r.data || []),
+    deezerCached(`/artist/${artistId}/top?limit=10`).then((r) => r.data || []),
+  ]);
+  const seedKey = songKey(found.title_short || found.title);
+  const ownPicks = shuffled(own.filter((t) => songKey(t.title_short || t.title) !== seedKey)).slice(0, 3);
+
+  const artists = shuffled(related.slice(0, 15)).slice(0, 10);
+  const relatedPicks = (
+    await mapLimit(artists, 5, (a) =>
+      deezerCached(`/artist/${a.id}/top?limit=10`)
+        .then((r) => shuffled((r.data || []).slice(0, 5))[0])
+        .catch(() => null)
+    )
+  ).filter(Boolean);
+
+  const candidates = [];
+  relatedPicks.forEach((t, i) => {
+    candidates.push(t);
+    if (i % 3 === 2 && ownPicks.length) candidates.push(ownPicks.shift());
+  });
+  candidates.push(...ownPicks);
+
+  const resolved = await mapLimit(candidates, 6, (t) =>
+    findOnYouTube(t.artist?.name, t.title_short || t.title).catch(() => null)
+  );
+  return dedupe(resolved).filter((t) => t.id !== videoId);
+}
+
+/* ---------------- radio ---------------- */
+
+// "Radio": songs related to videoId — the equivalent of Spotify's autoplay. Sources, in order:
+//  1. YouTube's Mix / YouTube Music song radio (often refused from cloud servers),
+//  2. similar artists from Deezer, matched to official uploads on YouTube,
+//  3. other songs by the same artist, as a last resort.
+const RADIO_TIMEOUT = 5000;
 // A source YouTube refuses from this server is skipped for a while, so later lookups
 // go straight to what works instead of waiting on requests that will fail again.
 const SOURCE_COOLDOWN = 15 * 60 * 1000;
 const sourceCooldown = new Map();
 
-async function radio(videoId, hint) {
+async function radio(videoId, seed) {
   const timeout = RADIO_TIMEOUT;
   const attempts = [
     ['mix', () => innertube('next', { videoId, playlistId: `RD${videoId}` }, { timeout })],
     ['music', () => innertube('next', { videoId, playlistId: `RDAMVM${videoId}` }, { kind: 'music', timeout })],
-    ['related', () => innertube('next', { videoId }, { timeout })],
   ];
   const failures = [];
   for (const [source, run] of attempts) {
@@ -238,19 +375,31 @@ async function radio(videoId, hint) {
       failures.push(`${source}: only ${tracks.length} tracks`);
     } catch (err) {
       sourceCooldown.set(source, Date.now() + SOURCE_COOLDOWN);
+      console.warn(`[radio] ${source} unavailable for 15 min: ${err.message}`);
       failures.push(`${source}: ${err.message}`);
     }
   }
-  if (hint) {
+
+  try {
+    const tracks = await similarSongs(seed, videoId);
+    if (tracks.length >= 3) return { tracks, source: 'similar-artists' };
+    failures.push(`similar-artists: only ${tracks.length} tracks`);
+  } catch (err) {
+    failures.push(`similar-artists: ${err.message}`);
+  }
+
+  if (seed.artist) {
     try {
-      const tracks = (await search(hint)).tracks.filter((t) => t.id !== videoId);
+      const tracks = (await cachedSearch(seed.artist)).tracks.filter(
+        (t) => t.id !== videoId && !VARIANT.test(t.rawTitle) && !sameSong(t, seed)
+      );
       if (tracks.length) {
-        console.warn(`[radio] ${videoId} fell back to search -> ${failures.join(' | ')}`);
-        return { tracks, source: 'search' };
+        console.warn(`[radio] ${videoId} fell back to artist search -> ${failures.join(' | ')}`);
+        return { tracks, source: 'artist-search' };
       }
-      failures.push('search: no results');
+      failures.push('artist-search: no usable results');
     } catch (err) {
-      failures.push(`search: ${err.message}`);
+      failures.push(`artist-search: ${err.message}`);
     }
   }
   throw new Error(failures.join(' | '));
@@ -294,8 +443,11 @@ app.get(
   wrap(async (req) => {
     const id = String(req.query.id || '');
     if (!/^[\w-]{11}$/.test(id)) return { tracks: [] };
-    const hint = String(req.query.hint || '').trim().slice(0, 100);
-    return cached(`r:${id}`, () => radio(id, hint));
+    const seed = {
+      artist: String(req.query.artist || '').trim().slice(0, 100),
+      title: String(req.query.title || '').trim().slice(0, 150),
+    };
+    return cached(`r:${id}`, () => radio(id, seed));
   })
 );
 

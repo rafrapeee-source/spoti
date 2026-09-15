@@ -25,7 +25,22 @@ function shuffleInPlace(arr) {
   return arr;
 }
 
-const titleKey = (t) => `${t.title}`.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+// Covers, karaoke, remixes, live recordings… skipped by autoplay unless you're already playing one.
+const VARIANT =
+  /\b(cover|karaoke|instrumental|reaction|remix|slowed|sped[ -]?up|reverb|8d|nightcore|tutorial|lesson|chords|mashup|live (at|from|in|on)|live performance)\b/i;
+const normKey = (s) => String(s || '').toLowerCase().normalize('NFKD').replace(/[^\p{L}\p{N}]/gu, '');
+// "Song (Acoustic) ft. X" and "Song" share a key, so another version of a song counts as a repeat.
+const songKey = (t) =>
+  normKey(String(t.title || '').replace(/\s*[([].*?[)\]]/g, '').replace(/\s+(ft\.?|feat\.?|featuring)\s.*$/i, ''));
+
+function isRepeat(track, keys) {
+  const key = songKey(track);
+  const raw = normKey(track.rawTitle);
+  for (const k of keys) {
+    if (k && (k === key || (k.length >= 6 && raw.includes(k)))) return true;
+  }
+  return false;
+}
 
 const store = {
   get(key, fallback) {
@@ -117,7 +132,8 @@ const state = {
 // Named track lists that rendered rows point at via data-list / data-id.
 const lists = new Map([
   ['liked', { tracks: state.liked, mode: 'context', name: 'Liked Songs' }],
-  ['recent', { tracks: state.recent, mode: 'context', name: 'Recently played' }],
+  // A song started from Recently played continues with related music, not the rest of the list.
+  ['recent', { tracks: state.recent, mode: 'radio', name: 'Recently played' }],
 ]);
 
 const GENRES = [
@@ -164,7 +180,7 @@ function startTrack(entry, { pushHistory = true } = {}) {
   }
   state.current = entry;
   state.played.add(entry.track.id);
-  state.playedTitles.add(titleKey(entry.track));
+  state.playedTitles.add(songKey(entry.track));
   addRecent(entry.track);
   player.load(entry.track.id);
   updateNowPlaying();
@@ -282,13 +298,14 @@ function appendAutoplay(tracks, gen) {
     ...state.context.tracks.map((t) => t.id),
     ...state.autoplay.map((t) => t.id),
   ]);
-  const titles = new Set([...state.playedTitles, ...state.autoplay.map(titleKey)]);
+  const keys = new Set([...state.playedTitles, ...state.autoplay.map(songKey)]);
+  const allowVariants = VARIANT.test(state.current?.track.rawTitle || '');
   const fresh = [];
   for (const t of tracks) {
-    const key = titleKey(t);
     if (!t.duration || t.duration > MAX_SONG_SECONDS) continue;
-    if (state.played.has(t.id) || taken.has(t.id) || titles.has(key)) continue;
-    titles.add(key);
+    if (state.played.has(t.id) || taken.has(t.id)) continue;
+    if ((!allowVariants && VARIANT.test(t.rawTitle)) || isRepeat(t, keys)) continue;
+    keys.add(songKey(t));
     fresh.push(t);
   }
   state.autoplay.push(...(state.shuffle ? shuffleInPlace(fresh) : fresh));
@@ -310,7 +327,7 @@ function ensureRadio() {
   const promise = (async () => {
     let added = 0;
     try {
-      const params = new URLSearchParams({ id: seed.id, hint: `${seed.artist} songs` });
+      const params = new URLSearchParams({ id: seed.id, artist: seed.artist, title: seed.title });
       const radio = await api(`/api/radio?${params}`);
       added = appendAutoplay(radio.tracks, gen);
     } catch (err) {
@@ -326,16 +343,18 @@ function ensureRadio() {
   return promise;
 }
 
-// Used when the user skips and nothing is lined up yet. The radio lookup can be slow, so a
-// plain artist search races it and whichever returns playable songs first wins.
+// Used when the user skips and nothing is lined up yet: wait for the related-songs lookup, and
+// only if it fails entirely fall back to other songs by the same artist.
 async function fillAutoplay() {
   const seed = state.current.track;
   const gen = state.radioGen;
-  const gotSongs = () => (state.autoplay.length ? true : Promise.reject(new Error('no songs')));
-  const artistSearch = api(`/api/search?q=${encodeURIComponent(`${seed.artist} songs`)}`).then((res) =>
-    appendAutoplay(res.tracks, gen)
-  );
-  await Promise.any([ensureRadio().then(gotSongs), artistSearch.then(gotSongs)]).catch(() => {});
+  await ensureRadio();
+  if (!state.autoplay.length && gen === state.radioGen) {
+    try {
+      const res = await api(`/api/search?q=${encodeURIComponent(seed.artist)}`);
+      appendAutoplay(res.tracks, gen);
+    } catch {}
+  }
   renderQueue();
 }
 
