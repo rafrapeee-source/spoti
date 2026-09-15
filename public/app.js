@@ -213,20 +213,21 @@ let advancing = false;
 async function next() {
   const entry = takeNext();
   if (entry) return startTrack(entry);
-  if (!state.current || advancing) return;
+  if (!state.current) return;
+  if (advancing) return toast('Finding similar songs…');
 
-  // Nothing lined up yet: wait for recommendations, then continue.
+  // Nothing lined up yet: fetch recommendations, then continue.
   advancing = true;
   const from = state.current;
+  const slow = setTimeout(() => toast('Finding similar songs…'), 400);
   try {
-    for (let attempt = 0; attempt < 2 && !state.autoplay.length; attempt++) {
-      await ensureRadio(true);
-      if (state.current !== from) return;
-    }
+    await fillAutoplay();
+    if (state.current !== from) return;
     const later = takeNext();
     if (later) startTrack(later);
     else toast("Couldn't find more songs to play");
   } finally {
+    clearTimeout(slow);
     advancing = false;
   }
 }
@@ -296,34 +297,22 @@ function appendAutoplay(tracks, gen) {
 
 // Keeps "Next up" stocked with songs similar to what's playing (same artist / genre),
 // using YouTube's auto-generated Mix for the current song as the seed.
-function ensureRadio(force = false) {
+function ensureRadio() {
   const seed = state.current?.track;
   if (!seed) return Promise.resolve();
   if (state.radioPromise) return state.radioPromise;
 
-  const usedSeed = state.radioSeeds.has(seed.id);
   const stocked = state.autoplay.length >= 5 || state.context.tracks.length > 2;
-  if (!force && (stocked || usedSeed)) return Promise.resolve();
+  if (stocked || state.radioSeeds.has(seed.id)) return Promise.resolve();
 
   const gen = state.radioGen;
   state.radioSeeds.add(seed.id);
   const promise = (async () => {
     let added = 0;
     try {
-      if (!usedSeed) {
-        try {
-          const params = new URLSearchParams({ id: seed.id, hint: `${seed.artist} songs` });
-          const radio = await api(`/api/radio?${params}`);
-          added = appendAutoplay(radio.tracks, gen);
-        } catch (err) {
-          console.warn('Radio lookup failed, trying artist search:', err.message);
-        }
-      }
-      // Radio failed or only had songs we've already heard: fall back to the artist.
-      if (!added && force) {
-        const res = await api(`/api/search?q=${encodeURIComponent(`${seed.artist} songs`)}`);
-        added = appendAutoplay(res.tracks, gen);
-      }
+      const params = new URLSearchParams({ id: seed.id, hint: `${seed.artist} songs` });
+      const radio = await api(`/api/radio?${params}`);
+      added = appendAutoplay(radio.tracks, gen);
     } catch (err) {
       console.warn('Autoplay lookup failed:', err.message);
     } finally {
@@ -335,6 +324,19 @@ function ensureRadio(force = false) {
   state.radioPromise = promise;
   renderQueue();
   return promise;
+}
+
+// Used when the user skips and nothing is lined up yet. The radio lookup can be slow, so a
+// plain artist search races it and whichever returns playable songs first wins.
+async function fillAutoplay() {
+  const seed = state.current.track;
+  const gen = state.radioGen;
+  const gotSongs = () => (state.autoplay.length ? true : Promise.reject(new Error('no songs')));
+  const artistSearch = api(`/api/search?q=${encodeURIComponent(`${seed.artist} songs`)}`).then((res) =>
+    appendAutoplay(res.tracks, gen)
+  );
+  await Promise.any([ensureRadio().then(gotSongs), artistSearch.then(gotSongs)]).catch(() => {});
+  renderQueue();
 }
 
 /* ---------- player events ---------- */

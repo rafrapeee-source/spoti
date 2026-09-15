@@ -55,13 +55,13 @@ function cached(key, fn) {
   return value;
 }
 
-async function innertube(endpoint, body, kind = 'web') {
+async function innertube(endpoint, body, { kind = 'web', timeout = 12000 } = {}) {
   const { url, client, headers } = CLIENTS[kind];
   const res = await fetch(`${url}/${endpoint}?prettyPrint=false`, {
     method: 'POST',
     headers: visitorData ? { ...headers, 'X-Goog-Visitor-Id': visitorData } : headers,
     body: JSON.stringify({ context: { client: visitorData ? { ...client, visitorData } : client }, ...body }),
-    signal: AbortSignal.timeout(12000),
+    signal: AbortSignal.timeout(timeout),
   });
   if (!res.ok) {
     visitorData = null;
@@ -213,19 +213,31 @@ function parseNext(data, videoId) {
 // "Radio": songs similar to videoId (same artist / genre) — the equivalent of Spotify's autoplay.
 // Sources are tried in order because YouTube sometimes rejects one of them from cloud servers:
 // the YouTube Mix, YouTube Music's song radio, related videos, then a search for the artist.
+const RADIO_TIMEOUT = 6000;
+// A source YouTube refuses from this server is skipped for a while, so later lookups
+// go straight to what works instead of waiting on requests that will fail again.
+const SOURCE_COOLDOWN = 15 * 60 * 1000;
+const sourceCooldown = new Map();
+
 async function radio(videoId, hint) {
+  const timeout = RADIO_TIMEOUT;
   const attempts = [
-    ['mix', () => innertube('next', { videoId, playlistId: `RD${videoId}` })],
-    ['music', () => innertube('next', { videoId, playlistId: `RDAMVM${videoId}` }, 'music')],
-    ['related', () => innertube('next', { videoId })],
+    ['mix', () => innertube('next', { videoId, playlistId: `RD${videoId}` }, { timeout })],
+    ['music', () => innertube('next', { videoId, playlistId: `RDAMVM${videoId}` }, { kind: 'music', timeout })],
+    ['related', () => innertube('next', { videoId }, { timeout })],
   ];
   const failures = [];
   for (const [source, run] of attempts) {
+    if ((sourceCooldown.get(source) || 0) > Date.now()) {
+      failures.push(`${source}: skipped, failed recently`);
+      continue;
+    }
     try {
       const tracks = parseNext(await run(), videoId);
       if (tracks.length >= 3) return { tracks, source };
       failures.push(`${source}: only ${tracks.length} tracks`);
     } catch (err) {
+      sourceCooldown.set(source, Date.now() + SOURCE_COOLDOWN);
       failures.push(`${source}: ${err.message}`);
     }
   }
