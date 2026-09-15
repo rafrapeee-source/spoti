@@ -46,7 +46,10 @@ const store = {
 async function api(url) {
   const res = await fetch(url);
   const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`);
+  if (!res.ok) {
+    const message = body.error || `Request failed (${res.status})`;
+    throw new Error(body.detail ? `${message}: ${body.detail}` : message);
+  }
   return body;
 }
 
@@ -305,20 +308,26 @@ function ensureRadio(force = false) {
   const gen = state.radioGen;
   state.radioSeeds.add(seed.id);
   const promise = (async () => {
+    let added = 0;
     try {
-      let added = 0;
       if (!usedSeed) {
-        const radio = await api(`/api/radio?id=${encodeURIComponent(seed.id)}`);
-        added = appendAutoplay(radio.tracks, gen);
+        try {
+          const params = new URLSearchParams({ id: seed.id, hint: `${seed.artist} songs` });
+          const radio = await api(`/api/radio?${params}`);
+          added = appendAutoplay(radio.tracks, gen);
+        } catch (err) {
+          console.warn('Radio lookup failed, trying artist search:', err.message);
+        }
       }
+      // Radio failed or only had songs we've already heard: fall back to the artist.
       if (!added && force) {
         const res = await api(`/api/search?q=${encodeURIComponent(`${seed.artist} songs`)}`);
-        appendAutoplay(res.tracks, gen);
+        added = appendAutoplay(res.tracks, gen);
       }
     } catch (err) {
-      console.warn('Autoplay lookup failed:', err);
-      if (gen === state.radioGen) state.radioSeeds.delete(seed.id);
+      console.warn('Autoplay lookup failed:', err.message);
     } finally {
+      if (!added && gen === state.radioGen) state.radioSeeds.delete(seed.id);
       if (state.radioPromise === promise) state.radioPromise = null;
       renderQueue();
     }

@@ -6,25 +6,34 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3000;
 
-const YT_BASE = 'https://www.youtube.com/youtubei/v1';
-const CLIENT = {
-  clientName: 'WEB',
-  clientVersion: '2.20250910.00.00',
-  hl: 'en',
-  gl: 'US',
+const USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
+
+function clientConfig(host, clientName, clientId, clientVersion) {
+  return {
+    url: `https://${host}/youtubei/v1`,
+    client: { clientName, clientVersion, hl: 'en', gl: 'US' },
+    headers: {
+      'Content-Type': 'application/json',
+      'User-Agent': USER_AGENT,
+      'Accept-Language': 'en-US,en;q=0.9',
+      'X-YouTube-Client-Name': clientId,
+      'X-YouTube-Client-Version': clientVersion,
+      Origin: `https://${host}`,
+      Referer: `https://${host}/`,
+      // Skips the EU consent interstitial.
+      Cookie: 'CONSENT=YES+1; SOCS=CAI',
+    },
+  };
+}
+
+const CLIENTS = {
+  web: clientConfig('www.youtube.com', 'WEB', '1', '2.20250910.00.00'),
+  music: clientConfig('music.youtube.com', 'WEB_REMIX', '67', '1.20250910.01.00'),
 };
-const HEADERS = {
-  'Content-Type': 'application/json',
-  'User-Agent':
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-  'Accept-Language': 'en-US,en;q=0.9',
-  'X-YouTube-Client-Name': '1',
-  'X-YouTube-Client-Version': CLIENT.clientVersion,
-  Origin: 'https://www.youtube.com',
-  Referer: 'https://www.youtube.com/',
-  // Skips the EU consent interstitial.
-  Cookie: 'CONSENT=YES+1; SOCS=CAI',
-};
+
+// Reusing the visitor id YouTube hands out makes follow-up requests look like one browser session.
+let visitorData = null;
 
 // Search filter: type = video
 const VIDEO_FILTER = 'EgIQAQ%3D%3D';
@@ -46,14 +55,26 @@ function cached(key, fn) {
   return value;
 }
 
-async function innertube(endpoint, body) {
-  const res = await fetch(`${YT_BASE}/${endpoint}?prettyPrint=false`, {
+async function innertube(endpoint, body, kind = 'web') {
+  const { url, client, headers } = CLIENTS[kind];
+  const res = await fetch(`${url}/${endpoint}?prettyPrint=false`, {
     method: 'POST',
-    headers: HEADERS,
-    body: JSON.stringify({ context: { client: CLIENT }, ...body }),
+    headers: visitorData ? { ...headers, 'X-Goog-Visitor-Id': visitorData } : headers,
+    body: JSON.stringify({ context: { client: visitorData ? { ...client, visitorData } : client }, ...body }),
+    signal: AbortSignal.timeout(12000),
   });
-  if (!res.ok) throw new Error(`YouTube ${endpoint} responded ${res.status}`);
-  return res.json();
+  if (!res.ok) {
+    visitorData = null;
+    const raw = await res.text().catch(() => '');
+    let reason = raw.slice(0, 160);
+    try {
+      reason = JSON.parse(raw).error?.message || reason;
+    } catch {}
+    throw new Error(`${kind} ${endpoint} HTTP ${res.status}${reason ? `: ${reason}` : ''}`);
+  }
+  const data = await res.json();
+  if (data?.responseContext?.visitorData) visitorData = data.responseContext.visitorData;
+  return data;
 }
 
 /* ---------------- parsing helpers ---------------- */
@@ -181,26 +202,51 @@ async function search(query, continuation) {
   return { tracks, continuation: tokens.at(-1) || null };
 }
 
-// "Radio": YouTube's auto-generated Mix (playlist RD<videoId>) is built from the
-// same artist and similar songs — the closest equivalent of Spotify's autoplay.
-async function radio(videoId) {
-  const data = await innertube('next', { videoId, playlistId: `RD${videoId}` });
-  let tracks = dedupe(collect(data, 'playlistPanelVideoRenderer').map(fromPlaylistPanel));
+function parseNext(data, videoId) {
+  return dedupe([
+    ...collect(data, 'playlistPanelVideoRenderer').map(fromPlaylistPanel),
+    ...collect(data, 'compactVideoRenderer').map(fromVideoRenderer),
+    ...collect(data, 'lockupViewModel').map(fromLockup),
+  ]).filter((t) => t.id !== videoId);
+}
 
-  if (tracks.length < 3) {
-    // Fallback: related videos from the watch page sidebar.
-    const related = [
-      ...collect(data, 'compactVideoRenderer').map(fromVideoRenderer),
-      ...collect(data, 'lockupViewModel').map(fromLockup),
-    ];
-    tracks = dedupe([...tracks, ...related]);
+// "Radio": songs similar to videoId (same artist / genre) — the equivalent of Spotify's autoplay.
+// Sources are tried in order because YouTube sometimes rejects one of them from cloud servers:
+// the YouTube Mix, YouTube Music's song radio, related videos, then a search for the artist.
+async function radio(videoId, hint) {
+  const attempts = [
+    ['mix', () => innertube('next', { videoId, playlistId: `RD${videoId}` })],
+    ['music', () => innertube('next', { videoId, playlistId: `RDAMVM${videoId}` }, 'music')],
+    ['related', () => innertube('next', { videoId })],
+  ];
+  const failures = [];
+  for (const [source, run] of attempts) {
+    try {
+      const tracks = parseNext(await run(), videoId);
+      if (tracks.length >= 3) return { tracks, source };
+      failures.push(`${source}: only ${tracks.length} tracks`);
+    } catch (err) {
+      failures.push(`${source}: ${err.message}`);
+    }
   }
-  return tracks.filter((t) => t.id !== videoId);
+  if (hint) {
+    try {
+      const tracks = (await search(hint)).tracks.filter((t) => t.id !== videoId);
+      if (tracks.length) {
+        console.warn(`[radio] ${videoId} fell back to search -> ${failures.join(' | ')}`);
+        return { tracks, source: 'search' };
+      }
+      failures.push('search: no results');
+    } catch (err) {
+      failures.push(`search: ${err.message}`);
+    }
+  }
+  throw new Error(failures.join(' | '));
 }
 
 async function suggest(q) {
   const url = `https://suggestqueries-clients6.youtube.com/complete/search?client=firefox&ds=yt&hl=en&q=${encodeURIComponent(q)}`;
-  const res = await fetch(url, { headers: { 'User-Agent': HEADERS['User-Agent'] } });
+  const res = await fetch(url, { headers: { 'User-Agent': USER_AGENT }, signal: AbortSignal.timeout(8000) });
   if (!res.ok) return [];
   const body = await res.json();
   return Array.isArray(body?.[1]) ? body[1].slice(0, 8) : [];
@@ -217,7 +263,7 @@ const wrap = (fn) => async (req, res) => {
     res.json(await fn(req));
   } catch (err) {
     console.error(`[${req.path}]`, err.message);
-    res.status(502).json({ error: 'Could not reach YouTube. Try again.' });
+    res.status(502).json({ error: 'YouTube request failed', detail: err.message });
   }
 };
 
@@ -236,7 +282,8 @@ app.get(
   wrap(async (req) => {
     const id = String(req.query.id || '');
     if (!/^[\w-]{11}$/.test(id)) return { tracks: [] };
-    return { tracks: await cached(`r:${id}`, () => radio(id)) };
+    const hint = String(req.query.hint || '').trim().slice(0, 100);
+    return cached(`r:${id}`, () => radio(id, hint));
   })
 );
 
