@@ -8,7 +8,7 @@ A Spotify-style web player. Search results come from YouTube, and songs play thr
 - **Queue**: *Play*, *Add to queue*, *Play next*, and removing or jumping to songs in the queue panel.
 - **Autoplay**: when your queue runs out, related songs keep playing, like Spotify's radio. They come from YouTube Music: the artist's "Fans might also like" artists, two top songs from each, mixed with the artist's own hits. When recommendations run out, a new radio starts from whatever is playing, so the music drifts naturally. If YouTube Music can't be reached from the server, Deezer's artist radio is used as a backup.
 - **Controls**: play/pause, seek (drag or arrow keys), next/previous, shuffle, repeat song, volume and mute.
-- **Library**: Liked Songs and Recently played, saved in the browser's localStorage.
+- **Library**: Liked Songs, saved in the browser's localStorage.
 - **Mobile layout**: a mini player plus a full-screen player.
 - **Keyboard shortcuts**: `Space` play/pause, `←`/`→` seek 5 seconds, `M` mute, `/` or `Ctrl+K` search.
 

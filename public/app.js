@@ -131,14 +131,16 @@ const state = {
   volume: store.get('volume', 80),
   muted: store.get('muted', false),
   liked: store.get('liked', []),
-  recent: store.get('recent', []),
 };
+
+// Recently played was removed; delete the history that older versions saved in the browser.
+try {
+  localStorage.removeItem('spoti:recent');
+} catch {}
 
 // Named track lists that rendered rows point at via data-list / data-id.
 const lists = new Map([
   ['liked', { tracks: state.liked, mode: 'context', name: 'Liked Songs' }],
-  // A song started from Recently played continues with related music, not the rest of the list.
-  ['recent', { tracks: state.recent, mode: 'radio', name: 'Recently played' }],
 ]);
 
 const GENRES = [
@@ -186,7 +188,6 @@ function startTrack(entry, { pushHistory = true } = {}) {
   state.current = entry;
   state.played.add(entry.track.id);
   state.playedTitles.add(songKey(entry.track));
-  addRecent(entry.track);
   player.load(entry.track.id);
   updateNowPlaying();
   renderQueue();
@@ -491,7 +492,7 @@ player.addEventListener('blocked', () => {
   toast("Couldn't load the player. youtube-nocookie.com may be blocked on this network.", 8000);
 });
 
-/* ================= library: liked + recent ================= */
+/* ================= library: liked songs ================= */
 
 const isLiked = (id) => state.liked.some((t) => t.id === id);
 
@@ -508,15 +509,6 @@ function toggleLike(track) {
   updateLikes();
   renderLibrary();
   if (document.body.dataset.route === 'liked') renderLiked();
-}
-
-function addRecent(track) {
-  const i = state.recent.findIndex((t) => t.id === track.id);
-  if (i >= 0) state.recent.splice(i, 1);
-  state.recent.unshift({ ...track });
-  if (state.recent.length > 30) state.recent.length = 30;
-  store.set('recent', state.recent);
-  renderLibrary();
 }
 
 /* ================= rendering ================= */
@@ -557,39 +549,13 @@ function rows(tracks, key, offset = 0) {
 const rowsHead = () =>
   `<div class="row row-head"><div class="row-num">#</div><div></div><div>Title</div><div></div><div></div>${icon.clock}<div></div></div>`;
 
-function cards(tracks, key) {
-  return `<div class="cards">${tracks
-    .map(
-      (t) => `
-    <div class="card" data-list="${key}" data-id="${esc(t.id)}">
-      <div class="card-art">
-        <img src="${esc(t.thumbnail.small)}" alt="" loading="lazy">
-        <button class="card-play pp" data-act="play" aria-label="Play ${esc(t.title)}">${icon.play}${icon.pause}</button>
-      </div>
-      <div class="card-title" title="${esc(t.rawTitle)}">${esc(t.title)}</div>
-      <div class="card-sub">${esc(t.artist)}</div>
-    </div>`
-    )
-    .join('')}</div>`;
-}
-
 function libraryHTML() {
   const n = state.liked.length;
-  const recent = state.recent
-    .map(
-      (t) => `
-    <div class="lib-item" data-list="recent" data-id="${esc(t.id)}" title="${esc(t.rawTitle)}">
-      <img class="lib-art" src="${esc(t.thumbnail.small)}" alt="" loading="lazy">
-      <div class="lib-meta"><div class="lib-title">${esc(t.title)}</div><div class="lib-sub">Song • ${esc(t.artist)}</div></div>
-    </div>`
-    )
-    .join('');
   return `
     <a class="lib-item" href="#/liked">
       <div class="lib-art liked-art">${icon.heart}</div>
       <div class="lib-meta"><div class="lib-title">Liked Songs</div><div class="lib-sub">Playlist • ${n} song${n === 1 ? '' : 's'}</div></div>
-    </a>
-    ${recent ? `<div class="lib-label">Recently played</div>${recent}` : '<p class="lib-empty">Songs you play will show up here.</p>'}`;
+    </a>`;
 }
 
 function renderLibrary() {
@@ -601,28 +567,17 @@ function renderLibrary() {
 function renderHome() {
   const hour = new Date().getHours();
   const greeting = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
-  const quick = state.recent
-    .slice(0, 7)
-    .map(
-      (t) => `
-    <div class="quick" data-list="recent" data-id="${esc(t.id)}" title="${esc(t.rawTitle)}">
-      <img src="${esc(t.thumbnail.small)}" alt="" loading="lazy"><span>${esc(t.title)}</span>
-      <button class="mini-play pp" data-act="play" aria-label="Play ${esc(t.title)}">${icon.play}${icon.pause}</button>
-    </div>`
-    )
-    .join('');
 
   view.innerHTML = `
     <section class="home-hero">
       <h1>${greeting}</h1>
       <div class="quick-grid">
         <a class="quick" href="#/liked"><div class="quick-art liked-art">${icon.heart}</div><span>Liked Songs</span></a>
-        ${quick}
       </div>
     </section>
     ${
-      state.recent.length
-        ? section('Recently played', cards(state.recent.slice(0, 12), 'recent'))
+      state.liked.length
+        ? ''
         : `<section class="welcome"><h2>Start listening</h2><p>Search for any song or artist. When your queue runs out, similar songs keep playing.</p><a class="pill" href="#/search">Search music</a></section>`
     }
     ${section('Browse genres', genreGrid())}`;
