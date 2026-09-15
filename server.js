@@ -344,10 +344,36 @@ function similarArtists(page) {
   return shelf ? artistLinks(shelf.contents) : [];
 }
 
-// Autoplay recommendations from YouTube Music: the artist's "Fans might also like" artists, two top
-// songs from each, with the artist's own hits mixed in. (YouTube Music's song radio and song-based
-// Related tab would be better, but Google blocks the request they need from cloud servers, for the
-// website and the phone app clients alike.)
+// Main artist of a credit like "The Weeknd, JENNIE & Lily Rose Depp" or "Calvin Harris feat. Rihanna".
+const leadArtist = (artist) => norm(String(artist || '').split(/,|&| x | feat\.? | ft\.? | with /i)[0]);
+
+// Orders recommendations like a radio station instead of in artist blocks: the closest artists come
+// early, the original artist returns every few songs, wider-genre picks spread through the second
+// half, and the same artist never plays twice in a row.
+function radioOrder({ own, near, far }) {
+  const jitter = (n) => Math.random() * n;
+  const order = [
+    ...near.map((t, i) => ({ t, at: i * 1.3 + jitter(3) })),
+    ...own.map((t, i) => ({ t, at: 2 + i * 4 + jitter(2) })),
+    ...far.map((t, i) => ({ t, at: 5 + i * 1.8 + jitter(4) })),
+  ]
+    .sort((a, b) => a.at - b.at)
+    .map((s) => s.t);
+
+  for (let i = 1; i < order.length; i++) {
+    const previous = leadArtist(order[i - 1].artist);
+    if (leadArtist(order[i].artist) !== previous) continue;
+    const j = order.findIndex((t, k) => k > i && leadArtist(t.artist) !== previous);
+    if (j > 0) order.splice(i, 0, ...order.splice(j, 1));
+  }
+  return order;
+}
+
+// Autoplay recommendations from YouTube Music, built like Spotify's radio from the artist's
+// "Fans might also like" list: one song from each similar artist, a few of the artist's own songs,
+// and one song each from artists similar to those, to reach the wider genre. (YouTube Music's song
+// radio and song-based Related tab would be better, but Google blocks the request they need from
+// cloud servers, for the website and the phone app clients alike.)
 async function ytmusicArtistRadio(videoId, seed, trace) {
   const query = `${stripExtras(seed.artist)} ${stripExtras(seed.title)}`.trim();
   if (!query) throw new Error('no artist or title to search for');
@@ -367,22 +393,43 @@ async function ytmusicArtistRadio(videoId, seed, trace) {
 
   const page = await ytmusicBrowse(artist.browseId);
   trace?.push({ step: `artist page: ${artist.name}`, shape: shapeOf(page) });
-  const similar = similarArtists(page).filter((a) => a.browseId !== artist.browseId).slice(0, 8);
-  const own = shuffled(topSongs(page, artist.name).filter((t) => t.id !== videoId && !sameSong(t, seed))).slice(0, 4);
-  const theirs = await mapLimit(similar, 4, (a) =>
-    ytmusicBrowse(a.browseId)
-      .then((p) => shuffled(topSongs(p, a.name).slice(0, 5)).slice(0, 2))
-      .catch(() => [])
-  );
-  trace?.push({ step: 'similar artists', artists: similar.map((a) => a.name), songsEach: theirs.map((s) => s.length) });
 
-  const tracks = [];
-  theirs.forEach((songs, i) => {
-    tracks.push(...songs);
-    if (i % 2 === 1 && own.length) tracks.push(own.shift());
+  // Skips the playing song, other versions of it, and covers, remixes or sped-up edits.
+  const usable = (songs) => songs.filter((t) => t.id !== videoId && !VARIANT.test(t.title) && !sameSong(t, seed));
+  const pickOne = (artistPage, a) => (artistPage ? shuffled(usable(topSongs(artistPage, a.name)).slice(0, 6))[0] : null);
+
+  const similar = similarArtists(page).filter((a) => a.browseId !== artist.browseId).slice(0, 10);
+  const similarPages = await mapLimit(similar, 5, (a) => ytmusicBrowse(a.browseId).catch(() => null));
+
+  // Artists similar to the similar artists, taken from their own "Fans might also like" lists,
+  // which came with the pages loaded above.
+  const known = new Set([artist.browseId, ...similar.map((a) => a.browseId)]);
+  const wider = new Map();
+  for (const p of similarPages) {
+    for (const a of p ? similarArtists(p) : []) if (!known.has(a.browseId)) wider.set(a.browseId, a);
+  }
+  const widerArtists = shuffled([...wider.values()]).slice(0, 5);
+  const widerPages = await mapLimit(widerArtists, 5, (a) => ytmusicBrowse(a.browseId).catch(() => null));
+
+  // Drops repeats: the same video, or the same song uploaded twice by the same artist.
+  const seen = new Set();
+  const fresh = (t) => {
+    if (!t) return false;
+    const key = `${leadArtist(t.artist)}|${songKey(t.title)}`;
+    if (seen.has(t.id) || seen.has(key)) return false;
+    seen.add(t.id).add(key);
+    return true;
+  };
+  const near = similar.map((a, i) => pickOne(similarPages[i], a)).filter(fresh);
+  const own = shuffled(usable(topSongs(page, artist.name))).filter(fresh).slice(0, 4);
+  const far = widerArtists.map((a, i) => pickOne(widerPages[i], a)).filter(fresh);
+  trace?.push({
+    step: 'mix',
+    similar: similar.map((a) => a.name),
+    widerGenre: widerArtists.map((a) => a.name),
+    songs: { own: own.length, near: near.length, far: far.length },
   });
-  tracks.push(...own);
-  return dedupe(tracks);
+  return radioOrder({ own, near, far });
 }
 
 const YTMUSIC_SOURCES = [['ytmusic-artists', ytmusicArtistRadio]];
