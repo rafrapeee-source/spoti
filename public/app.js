@@ -29,9 +29,13 @@ function shuffleInPlace(arr) {
 const VARIANT =
   /\b(cover|karaoke|instrumental|reaction|remix|slowed|sped[ -]?up|reverb|8d|nightcore|tutorial|lesson|chords|mashup|live (at|from|in|on)|live performance)\b/i;
 const normKey = (s) => String(s || '').toLowerCase().normalize('NFKD').replace(/[^\p{L}\p{N}]/gu, '');
+const stripExtras = (s) =>
+  String(s || '')
+    .replace(/\s*[([].*?[)\]]/g, '')
+    .replace(/\s+(ft\.?|feat\.?|featuring)\s.*$/i, '')
+    .trim();
 // "Song (Acoustic) ft. X" and "Song" share a key, so another version of a song counts as a repeat.
-const songKey = (t) =>
-  normKey(String(t.title || '').replace(/\s*[([].*?[)\]]/g, '').replace(/\s+(ft\.?|feat\.?|featuring)\s.*$/i, ''));
+const songKey = (t) => normKey(stripExtras(t.title));
 
 function isRepeat(track, keys) {
   const key = songKey(track);
@@ -58,8 +62,8 @@ const store = {
   },
 };
 
-async function api(url) {
-  const res = await fetch(url);
+async function api(url, init) {
+  const res = await fetch(url, init);
   const body = await res.json().catch(() => ({}));
   if (!res.ok) {
     const message = body.error || `Request failed (${res.status})`;
@@ -121,6 +125,7 @@ const state = {
   radioGen: 0,
   radioSeeds: new Set(),
   radioPromise: null,
+  pending: [], // recommended songs (artist + title) not yet matched to a YouTube video
   shuffle: store.get('shuffle', false),
   repeat: store.get('repeat', 'off'), // 'off' | 'one'
   volume: store.get('volume', 80),
@@ -286,6 +291,7 @@ function addToQueue(track, { playNext = false } = {}) {
 function resetRadio() {
   state.radioGen++;
   state.autoplay.length = 0;
+  state.pending.length = 0;
   state.radioSeeds.clear();
   state.radioPromise = null;
 }
@@ -312,28 +318,110 @@ function appendAutoplay(tracks, gen) {
   return fresh.length;
 }
 
-// Keeps "Next up" stocked with songs similar to what's playing (same artist / genre),
-// using YouTube's auto-generated Mix for the current song as the seed.
+// Deezer's public API, called from the browser with JSONP (it sends no CORS headers). It runs here
+// rather than on the server because Deezer, like YouTube, blocks requests from cloud servers.
+let deezerSeq = 0;
+function deezer(path) {
+  return new Promise((resolve, reject) => {
+    const callback = `__deezer${++deezerSeq}`;
+    const script = document.createElement('script');
+    const finish = (err, data) => {
+      clearTimeout(timer);
+      window[callback] = () => {}; // a response arriving after the timeout must not throw
+      script.remove();
+      if (err) reject(err);
+      else if (data?.error) reject(new Error(`Deezer: ${data.error.message || data.error.type}`));
+      else resolve(data);
+    };
+    const timer = setTimeout(() => finish(new Error('Deezer timed out')), 8000);
+    window[callback] = (data) => finish(null, data);
+    script.onerror = () => finish(new Error('Deezer is unreachable'));
+    script.src = `https://api.deezer.com${path}${path.includes('?') ? '&' : '?'}output=jsonp&callback=${callback}`;
+    document.head.append(script);
+  });
+}
+
+async function deezerTrackFor(track) {
+  const artist = stripExtras(track.artist);
+  const title = stripExtras(track.title);
+  const artistKey = normKey(artist);
+  for (const q of new Set([`${artist} ${title}`.trim(), title])) {
+    if (!q) continue;
+    const { data = [] } = await deezer(`/search?limit=10&q=${encodeURIComponent(q)}`);
+    const sameArtist = data.find((d) => {
+      const a = normKey(d.artist?.name);
+      return artistKey && a && (a.includes(artistKey) || artistKey.includes(a));
+    });
+    if (sameArtist || data[0]) return sameArtist || data[0];
+  }
+  return null;
+}
+
+// Deezer's artist radio: songs by the artist and by similar artists — the same idea as Spotify's radio.
+async function loadDeezerRadio(seed, gen) {
+  const found = await deezerTrackFor(seed);
+  if (!found?.artist?.id) throw new Error('song not found on Deezer');
+  const { data = [] } = await deezer(`/artist/${found.artist.id}/radio?limit=40`);
+  if (gen !== state.radioGen) return;
+  const keys = new Set([
+    songKey(seed),
+    songKey({ title: found.title_short || found.title }),
+    ...state.playedTitles,
+    ...state.autoplay.map(songKey),
+    ...state.pending.map(songKey),
+  ]);
+  for (const d of data) {
+    const song = { artist: d.artist?.name || '', title: d.title_short || d.title || '', duration: d.duration || 0 };
+    const key = songKey(song);
+    if (!song.artist || !key || keys.has(key)) continue;
+    keys.add(key);
+    state.pending.push(song);
+  }
+  if (state.shuffle) shuffleInPlace(state.pending);
+}
+
+// Matches the next few recommended songs to their YouTube uploads (via our server's YouTube search).
+async function matchPending(gen) {
+  const songs = state.pending.splice(0, 6);
+  const { tracks = [] } = await api('/api/match', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ songs }),
+  });
+  return appendAutoplay(tracks.filter(Boolean), gen);
+}
+
+// Keeps "Next up" stocked with a few songs at a time. When the recommendations run out, a new
+// radio starts from whatever is playing then, so the music drifts naturally like Spotify's.
+// If Deezer can't be reached, the server's own YouTube-based lookup is used instead.
 function ensureRadio() {
   const seed = state.current?.track;
   if (!seed) return Promise.resolve();
   if (state.radioPromise) return state.radioPromise;
-
-  const stocked = state.autoplay.length >= 5 || state.context.tracks.length > 2;
-  if (stocked || state.radioSeeds.has(seed.id)) return Promise.resolve();
+  if (state.autoplay.length >= 4 || state.context.tracks.length > 2) return Promise.resolve();
+  if (!state.pending.length && state.radioSeeds.has(seed.id)) return Promise.resolve();
 
   const gen = state.radioGen;
-  state.radioSeeds.add(seed.id);
   const promise = (async () => {
-    let added = 0;
     try {
-      const params = new URLSearchParams({ id: seed.id, artist: seed.artist, title: seed.title });
-      const radio = await api(`/api/radio?${params}`);
-      added = appendAutoplay(radio.tracks, gen);
+      if (!state.pending.length) {
+        state.radioSeeds.add(seed.id);
+        try {
+          await loadDeezerRadio(seed, gen);
+        } catch (err) {
+          console.warn('Deezer radio unavailable, using server lookup:', err.message);
+          const params = new URLSearchParams({ id: seed.id, artist: seed.artist, title: seed.title });
+          appendAutoplay((await api(`/api/radio?${params}`)).tracks, gen);
+        }
+      }
+      while (gen === state.radioGen && state.autoplay.length < 4 && state.pending.length) {
+        await matchPending(gen);
+        renderQueue();
+      }
     } catch (err) {
       console.warn('Autoplay lookup failed:', err.message);
+      if (gen === state.radioGen) state.radioSeeds.delete(seed.id);
     } finally {
-      if (!added && gen === state.radioGen) state.radioSeeds.delete(seed.id);
       if (state.radioPromise === promise) state.radioPromise = null;
       renderQueue();
     }
@@ -675,7 +763,7 @@ function renderQueue() {
     html += state.context.tracks.slice(0, 50).map((t, i) => item(t, 'context', i)).join('');
   }
   if (cur) {
-    html += `<h3>Next up · Autoplay</h3><p class="hint">Similar songs based on what you're playing.</p>`;
+    html += `<h3>Next up · Autoplay</h3><p class="hint">Songs by this artist and similar artists.</p>`;
     html += state.autoplay.length
       ? state.autoplay.slice(0, 50).map((t, i) => item(t, 'autoplay', i)).join('')
       : `<p class="hint">${state.radioPromise ? 'Finding similar songs…' : 'Recommendations will appear here.'}</p>`;

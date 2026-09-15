@@ -262,15 +262,6 @@ function sameSong(track, seed) {
   return songKey(track.title) === key || (key.length >= 6 && norm(track.rawTitle).includes(key));
 }
 
-function shuffled(list) {
-  const a = [...list];
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
-}
-
 async function mapLimit(items, limit, fn) {
   const out = new Array(items.length);
   let next = 0;
@@ -285,7 +276,7 @@ async function mapLimit(items, limit, fn) {
 }
 
 // Picks the official upload of a song from YouTube search results, skipping covers and live versions.
-async function findOnYouTube(artist, title) {
+async function findOnYouTube(artist, title, duration = 0) {
   const artistKey = norm(artist);
   const titleKey = songKey(title);
   if (!artistKey || !titleKey) return null;
@@ -301,78 +292,13 @@ async function findOnYouTube(artist, title) {
     if (/official/i.test(t.rawTitle)) score += 1;
     if (VARIANT.test(t.rawTitle)) score -= 4;
     if (t.duration < 60 || t.duration > 600) score -= 4;
+    if (duration && Math.abs(t.duration - duration) <= 20) score += 2;
     if (score > bestScore) {
       best = t;
       bestScore = score;
     }
   }
   return best && { ...best, title, artist };
-}
-
-/* ---------------- similar artists (Deezer public API, no key needed) ---------------- */
-
-async function deezer(pathAndQuery) {
-  const res = await fetch(`https://api.deezer.com${pathAndQuery}`, {
-    headers: { 'User-Agent': USER_AGENT },
-    signal: AbortSignal.timeout(8000),
-  });
-  if (!res.ok) throw new Error(`deezer HTTP ${res.status}`);
-  const data = await res.json();
-  if (data?.error) throw new Error(`deezer: ${data.error.message || data.error.type || 'error'}`);
-  return data;
-}
-const deezerCached = (pathAndQuery) => cached(`dz:${pathAndQuery}`, () => deezer(pathAndQuery));
-
-async function findOnDeezer(seed) {
-  const artist = stripExtras(seed.artist);
-  const title = stripExtras(seed.title);
-  const artistKey = norm(artist);
-  for (const q of new Set([`${artist} ${title}`.trim(), title])) {
-    if (!q) continue;
-    const { data = [] } = await deezerCached(`/search?limit=10&q=${encodeURIComponent(q)}`);
-    const byArtist = data.find((t) => {
-      const a = norm(t.artist?.name);
-      return artistKey && a && (a.includes(artistKey) || artistKey.includes(a));
-    });
-    if (byArtist || data[0]) return byArtist || data[0];
-  }
-  return null;
-}
-
-// Spotify-style radio: one song from each of ten similar artists, with the seed artist's
-// other hits mixed in every third song, each matched to its official upload on YouTube.
-async function similarSongs(seed, videoId) {
-  const found = await findOnDeezer(seed);
-  const artistId = found?.artist?.id;
-  if (!artistId) throw new Error('song not found on Deezer');
-
-  const [related, own] = await Promise.all([
-    deezerCached(`/artist/${artistId}/related?limit=20`).then((r) => r.data || []),
-    deezerCached(`/artist/${artistId}/top?limit=10`).then((r) => r.data || []),
-  ]);
-  const seedKey = songKey(found.title_short || found.title);
-  const ownPicks = shuffled(own.filter((t) => songKey(t.title_short || t.title) !== seedKey)).slice(0, 3);
-
-  const artists = shuffled(related.slice(0, 15)).slice(0, 10);
-  const relatedPicks = (
-    await mapLimit(artists, 5, (a) =>
-      deezerCached(`/artist/${a.id}/top?limit=10`)
-        .then((r) => shuffled((r.data || []).slice(0, 5))[0])
-        .catch(() => null)
-    )
-  ).filter(Boolean);
-
-  const candidates = [];
-  relatedPicks.forEach((t, i) => {
-    candidates.push(t);
-    if (i % 3 === 2 && ownPicks.length) candidates.push(ownPicks.shift());
-  });
-  candidates.push(...ownPicks);
-
-  const resolved = await mapLimit(candidates, 6, (t) =>
-    findOnYouTube(t.artist?.name, t.title_short || t.title).catch(() => null)
-  );
-  return dedupe(resolved).filter((t) => t.id !== videoId);
 }
 
 /* ---------------- radio ---------------- */
@@ -414,8 +340,8 @@ const RADIO_TIMEOUT = 5000;
 
 // "Radio": songs related to videoId — the equivalent of Spotify's autoplay. YouTube's related
 // videos are tried first, through three different kinds of request because YouTube sometimes
-// refuses one of them from cloud servers. Only if all fail: similar artists (Deezer), then
-// other songs by the same artist.
+// refuses one of them from cloud servers. If all fail: other songs by the same artist.
+// (The browser normally gets recommendations from Deezer instead; see /api/match.)
 const RELATED_SOURCES = [
   ['youtube', (videoId) => innertube('next', { videoId, playlistId: `RD${videoId}` }, { timeout: RADIO_TIMEOUT })],
   ['watch-page', (videoId) => watchPage(videoId)],
@@ -446,14 +372,6 @@ async function radio(videoId, seed) {
       console.warn(`[radio] ${source} unavailable for 15 min: ${err.message}`);
       failures.push(`${source}: ${err.message}`);
     }
-  }
-
-  try {
-    const tracks = await similarSongs(seed, videoId);
-    if (tracks.length >= 3) return { tracks, source: 'similar-artists' };
-    failures.push(`similar-artists: only ${tracks.length} tracks`);
-  } catch (err) {
-    failures.push(`similar-artists: ${err.message}`);
   }
 
   if (seed.artist) {
@@ -520,15 +438,32 @@ app.get(
   })
 );
 
+// Matches songs recommended in the browser (artist + title from Deezer) to their official YouTube
+// uploads. YouTube search works from this server even when YouTube's other endpoints don't.
+app.post(
+  '/api/match',
+  express.json({ limit: '32kb' }),
+  wrap(async (req) => {
+    const songs = (Array.isArray(req.body?.songs) ? req.body.songs : []).slice(0, 10).map((s) => ({
+      artist: String(s?.artist || '').trim().slice(0, 100),
+      title: String(s?.title || '').trim().slice(0, 150),
+      duration: Number(s?.duration) || 0,
+    }));
+    const tracks = await mapLimit(songs, 4, (s) =>
+      cached(`m:${s.artist}:${s.title}`, () => findOnYouTube(s.artist, s.title, s.duration)).catch(() => null)
+    );
+    return { tracks };
+  })
+);
+
 // Diagnostics: runs every autoplay source for one video from this server and reports what each
 // returned or why it failed. Open /api/debug/radio?id=VIDEO_ID&artist=...&title=... on Render.
 app.get('/api/debug/radio', async (req, res) => {
   const id = String(req.query.id || '');
   if (!/^[\w-]{11}$/.test(id)) return res.status(400).json({ error: 'Pass ?id= with an 11-character video id' });
   const seed = seedFrom(req);
-  const sources = [...RELATED_SOURCES, ['similar-artists', (videoId) => similarSongs(seed, videoId)]];
   const report = [];
-  for (const [source, run] of sources) {
+  for (const [source, run] of RELATED_SOURCES) {
     const started = Date.now();
     try {
       const tracks = await run(id);
