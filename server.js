@@ -347,26 +347,30 @@ function similarArtists(page) {
 // Main artist of a credit like "The Weeknd, JENNIE & Lily Rose Depp" or "Calvin Harris feat. Rihanna".
 const leadArtist = (artist) => norm(String(artist || '').split(/,|&| x | feat\.? | ft\.? | with /i)[0]);
 
-// Orders recommendations like a radio station instead of in artist blocks: the closest artists come
-// early, the original artist returns every few songs, wider-genre picks spread through the second
-// half, and the same artist never plays twice in a row.
-function radioOrder({ own, near, far }) {
+// Orders recommendations like a radio station. Each block is one artist's run of 1-3 songs. The
+// opening block (more songs by the original artist, if any) plays first; then the closest artists,
+// with the original artist returning now and then and wider-genre picks spread through the second
+// half. Two blocks by the same artist are never placed next to each other, so a run is always a
+// deliberate one and never grows past its own length.
+function radioOrder({ opening, own, near, far }) {
   const jitter = (n) => Math.random() * n;
-  const order = [
-    ...near.map((t, i) => ({ t, at: i * 1.3 + jitter(3) })),
-    ...own.map((t, i) => ({ t, at: 2 + i * 4 + jitter(2) })),
-    ...far.map((t, i) => ({ t, at: 5 + i * 1.8 + jitter(4) })),
+  const blocks = [
+    ...near.map((songs, i) => ({ songs, at: i * 1.3 + jitter(3) })),
+    ...own.map((song, i) => ({ songs: [song], at: 4 + i * 5 + jitter(3) })),
+    ...far.map((songs, i) => ({ songs, at: 5 + i * 1.8 + jitter(4) })),
   ]
     .sort((a, b) => a.at - b.at)
-    .map((s) => s.t);
+    .map((b) => b.songs);
+  const order = opening.length ? [opening, ...blocks] : blocks;
 
+  const artistOf = (songs) => leadArtist(songs[0].artist);
   for (let i = 1; i < order.length; i++) {
-    const previous = leadArtist(order[i - 1].artist);
-    if (leadArtist(order[i].artist) !== previous) continue;
-    const j = order.findIndex((t, k) => k > i && leadArtist(t.artist) !== previous);
+    const previous = artistOf(order[i - 1]);
+    if (artistOf(order[i]) !== previous) continue;
+    const j = order.findIndex((songs, k) => k > i && artistOf(songs) !== previous);
     if (j > 0) order.splice(i, 0, ...order.splice(j, 1));
   }
-  return order;
+  return order.flat();
 }
 
 // Autoplay recommendations from YouTube Music, built like Spotify's radio from the artist's
@@ -396,7 +400,6 @@ async function ytmusicArtistRadio(videoId, seed, trace) {
 
   // Skips the playing song, other versions of it, and covers, remixes or sped-up edits.
   const usable = (songs) => songs.filter((t) => t.id !== videoId && !VARIANT.test(t.title) && !sameSong(t, seed));
-  const pickOne = (artistPage, a) => (artistPage ? shuffled(usable(topSongs(artistPage, a.name)).slice(0, 6))[0] : null);
 
   const similar = similarArtists(page).filter((a) => a.browseId !== artist.browseId).slice(0, 10);
   const similarPages = await mapLimit(similar, 5, (a) => ytmusicBrowse(a.browseId).catch(() => null));
@@ -420,16 +423,31 @@ async function ytmusicArtistRadio(videoId, seed, trace) {
     seen.add(t.id).add(key);
     return true;
   };
-  const near = similar.map((a, i) => pickOne(similarPages[i], a)).filter(fresh);
-  const own = shuffled(usable(topSongs(page, artist.name))).filter(fresh).slice(0, 4);
-  const far = widerArtists.map((a, i) => pickOne(widerPages[i], a)).filter(fresh);
+  // Up to `count` songs by one artist, picked at random from their six most popular.
+  const songsBy = (artistPage, a, count) => {
+    const picked = [];
+    for (const t of artistPage ? shuffled(usable(topSongs(artistPage, a.name)).slice(0, 6)) : []) {
+      if (picked.length === count) break;
+      if (fresh(t)) picked.push(t);
+    }
+    return picked;
+  };
+
+  // Like Spotify, autoplay sometimes stays with an artist before moving on: it opens with 0-3 more
+  // songs by the original artist (usually 1-2), and about a third of similar artists get two songs.
+  const openingLength = [0, 1, 1, 2, 2, 3][Math.floor(Math.random() * 6)];
+  const ownSongs = songsBy(page, artist, 5);
+  const opening = ownSongs.splice(0, openingLength);
+  const own = ownSongs.slice(0, 2);
+  const near = similar.map((a, i) => songsBy(similarPages[i], a, Math.random() < 0.3 ? 2 : 1)).filter((b) => b.length);
+  const far = widerArtists.map((a, i) => songsBy(widerPages[i], a, 1)).filter((b) => b.length);
   trace?.push({
     step: 'mix',
     similar: similar.map((a) => a.name),
     widerGenre: widerArtists.map((a) => a.name),
-    songs: { own: own.length, near: near.length, far: far.length },
+    songs: { opening: opening.length, ownLater: own.length, similar: near.flat().length, wider: far.flat().length },
   });
-  return radioOrder({ own, near, far });
+  return radioOrder({ opening, own, near, far });
 }
 
 const YTMUSIC_SOURCES = [['ytmusic-artists', ytmusicArtistRadio]];
