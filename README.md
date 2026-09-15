@@ -6,7 +6,7 @@ A Spotify-style web player. Search results come from YouTube, and songs play thr
 
 - **Search**: YouTube search with suggestions as you type, a top result, and more results that load as you scroll.
 - **Queue**: *Play*, *Add to queue*, *Play next*, and removing or jumping to songs in the queue panel.
-- **Autoplay**: when your queue runs out, similar songs keep playing (same artist or genre). These come from YouTube's auto-generated Mix for the song that's playing.
+- **Autoplay**: when your queue runs out, related songs keep playing. They come from the YouTube video's related videos (filtered to music only) mixed with YouTube's auto-generated Mix. If YouTube refuses those requests from the server, songs by similar artists (from Deezer's public API) are used instead.
 - **Controls**: play/pause, seek (drag or arrow keys), next/previous, shuffle, repeat song, volume and mute.
 - **Library**: Liked Songs and Recently played, saved in the browser's localStorage.
 - **Mobile layout**: a mini player plus a full-screen player.
@@ -30,6 +30,10 @@ The browser never contacts `www.youtube.com` or `i.ytimg.com`. Search results, r
    - Build command: `npm install`
    - Start command: `npm start`
 3. Open the `.onrender.com` URL.
+
+## Troubleshooting autoplay
+
+Open `https://<your-app>.onrender.com/api/debug/radio?id=VIDEO_ID&artist=ARTIST&title=TITLE`. It runs every autoplay source from the server and shows, for each one, how many songs it returned or why it failed.
 
 ## Run locally
 

@@ -57,14 +57,22 @@ function cached(key, fn) {
 
 async function innertube(endpoint, body, { kind = 'web', timeout = 12000 } = {}) {
   const { url, client, headers } = CLIENTS[kind];
-  const res = await fetch(`${url}/${endpoint}?prettyPrint=false`, {
-    method: 'POST',
-    headers: visitorData ? { ...headers, 'X-Goog-Visitor-Id': visitorData } : headers,
-    body: JSON.stringify({ context: { client: visitorData ? { ...client, visitorData } : client }, ...body }),
-    signal: AbortSignal.timeout(timeout),
-  });
-  if (!res.ok) {
+  for (let attempt = 0; ; attempt++) {
+    const visitor = visitorData;
+    const res = await fetch(`${url}/${endpoint}?prettyPrint=false`, {
+      method: 'POST',
+      headers: visitor ? { ...headers, 'X-Goog-Visitor-Id': visitor } : headers,
+      body: JSON.stringify({ context: { client: visitor ? { ...client, visitorData: visitor } : client }, ...body }),
+      signal: AbortSignal.timeout(timeout),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data?.responseContext?.visitorData) visitorData = data.responseContext.visitorData;
+      return data;
+    }
     visitorData = null;
+    // A stale visitor id can make YouTube reject a request: retry once without it.
+    if (visitor && attempt === 0) continue;
     const raw = await res.text().catch(() => '');
     let reason = raw.slice(0, 160);
     try {
@@ -72,9 +80,6 @@ async function innertube(endpoint, body, { kind = 'web', timeout = 12000 } = {})
     } catch {}
     throw new Error(`${kind} ${endpoint} HTTP ${res.status}${reason ? `: ${reason}` : ''}`);
   }
-  const data = await res.json();
-  if (data?.responseContext?.visitorData) visitorData = data.responseContext.visitorData;
-  return data;
 }
 
 /* ---------------- parsing helpers ---------------- */
@@ -87,6 +92,19 @@ function collect(node, key, out = []) {
     for (const [k, v] of Object.entries(node)) {
       if (k === key) out.push(v);
       else collect(v, key, out);
+    }
+  }
+  return out;
+}
+
+// Like collect(), but parses several keys at once and keeps their order in the document.
+function collectMany(node, parsers, out = []) {
+  if (Array.isArray(node)) {
+    for (const item of node) collectMany(item, parsers, out);
+  } else if (node && typeof node === 'object') {
+    for (const [k, v] of Object.entries(node)) {
+      if (Object.hasOwn(parsers, k)) out.push(parsers[k](v));
+      else collectMany(v, parsers, out);
     }
   }
   return out;
@@ -202,12 +220,24 @@ async function search(query, continuation) {
   return { tracks, continuation: tokens.at(-1) || null };
 }
 
-function parseNext(data, videoId) {
-  return dedupe([
-    ...collect(data, 'playlistPanelVideoRenderer').map(fromPlaylistPanel),
-    ...collect(data, 'compactVideoRenderer').map(fromVideoRenderer),
-    ...collect(data, 'lockupViewModel').map(fromLockup),
-  ]).filter((t) => t.id !== videoId);
+// The regular watch page embeds the same data as the `next` API (related videos + the Mix) in its
+// HTML. It's a different kind of request, so it can still work when the API call is refused.
+async function watchPage(videoId) {
+  const res = await fetch(`https://www.youtube.com/watch?v=${videoId}&list=RD${videoId}&hl=en&gl=US`, {
+    headers: { 'User-Agent': USER_AGENT, 'Accept-Language': 'en-US,en;q=0.9', Cookie: 'CONSENT=YES+1; SOCS=CAI' },
+    signal: AbortSignal.timeout(RADIO_TIMEOUT + 3000),
+  });
+  if (!res.ok) throw new Error(`watch page HTTP ${res.status}`);
+  const html = await res.text();
+  const marker = html.search(/ytInitialData"?\]?\s*=\s*\{/);
+  if (marker < 0) {
+    const blocked = /captcha|unusual traffic|consent\.youtube/i.test(html);
+    throw new Error(blocked ? 'watch page blocked by a bot check' : 'watch page had no ytInitialData');
+  }
+  const start = html.indexOf('{', marker);
+  const end = html.indexOf(';</script>', start);
+  if (end < 0) throw new Error('watch page data was cut off');
+  return JSON.parse(html.slice(start, end));
 }
 
 const cachedSearch = (q) => cached(`s:${q}:`, () => search(q));
@@ -347,32 +377,70 @@ async function similarSongs(seed, videoId) {
 
 /* ---------------- radio ---------------- */
 
-// "Radio": songs related to videoId — the equivalent of Spotify's autoplay. Sources, in order:
-//  1. YouTube's Mix / YouTube Music song radio (often refused from cloud servers),
-//  2. similar artists from Deezer, matched to official uploads on YouTube,
-//  3. other songs by the same artist, as a last resort.
+// Words that mark a related video as something other than a song.
+const NOT_MUSIC =
+  /\b(reaction|reacts?|review|interview|podcast|trailer|documentary|tutorial|lesson|explained|vlog|gameplay|news|episode|behind the scenes|making of|unboxing)\b/i;
+const MUSIC_HINT = /official (music )?(video|audio)|lyrics?|visuali[sz]er|\bm\/?v\b|\baudio\b/i;
+
+// A related video is kept only if it looks like a song: song length, not a cover or reaction,
+// and from an artist/label channel or titled like a music upload ("Artist - Song").
+function looksLikeMusic(t) {
+  if (t.duration < 90 || t.duration > 8 * 60) return false;
+  if (NOT_MUSIC.test(t.rawTitle) || VARIANT.test(t.rawTitle)) return false;
+  return / - Topic$|VEVO$/i.test(t.channel) || MUSIC_HINT.test(t.rawTitle) || /\s[-–—]\s/.test(t.rawTitle);
+}
+
+function interleave(a, b) {
+  const out = [];
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    if (i < a.length) out.push(a[i]);
+    if (i < b.length) out.push(b[i]);
+  }
+  return out;
+}
+
+// Related videos filtered to music, woven together with YouTube's auto-generated Mix for the
+// video (which is music-only already).
+function relatedMusic(data, videoId) {
+  const others = (tracks) => dedupe(tracks).filter((t) => t.id !== videoId);
+  const mix = others(collect(data, 'playlistPanelVideoRenderer').map(fromPlaylistPanel));
+  const related = others(
+    collectMany(data, { compactVideoRenderer: fromVideoRenderer, lockupViewModel: fromLockup })
+  ).filter(looksLikeMusic);
+  return dedupe(interleave(related, mix));
+}
+
 const RADIO_TIMEOUT = 5000;
+
+// "Radio": songs related to videoId — the equivalent of Spotify's autoplay. YouTube's related
+// videos are tried first, through three different kinds of request because YouTube sometimes
+// refuses one of them from cloud servers. Only if all fail: similar artists (Deezer), then
+// other songs by the same artist.
+const RELATED_SOURCES = [
+  ['youtube', (videoId) => innertube('next', { videoId, playlistId: `RD${videoId}` }, { timeout: RADIO_TIMEOUT })],
+  ['watch-page', (videoId) => watchPage(videoId)],
+  [
+    'youtube-music',
+    (videoId) => innertube('next', { videoId, playlistId: `RDAMVM${videoId}` }, { kind: 'music', timeout: RADIO_TIMEOUT }),
+  ],
+].map(([source, fetchData]) => [source, async (videoId) => relatedMusic(await fetchData(videoId), videoId)]);
+
 // A source YouTube refuses from this server is skipped for a while, so later lookups
 // go straight to what works instead of waiting on requests that will fail again.
 const SOURCE_COOLDOWN = 15 * 60 * 1000;
 const sourceCooldown = new Map();
 
 async function radio(videoId, seed) {
-  const timeout = RADIO_TIMEOUT;
-  const attempts = [
-    ['mix', () => innertube('next', { videoId, playlistId: `RD${videoId}` }, { timeout })],
-    ['music', () => innertube('next', { videoId, playlistId: `RDAMVM${videoId}` }, { kind: 'music', timeout })],
-  ];
   const failures = [];
-  for (const [source, run] of attempts) {
+  for (const [source, run] of RELATED_SOURCES) {
     if ((sourceCooldown.get(source) || 0) > Date.now()) {
       failures.push(`${source}: skipped, failed recently`);
       continue;
     }
     try {
-      const tracks = parseNext(await run(), videoId);
+      const tracks = await run(videoId);
       if (tracks.length >= 3) return { tracks, source };
-      failures.push(`${source}: only ${tracks.length} tracks`);
+      failures.push(`${source}: only ${tracks.length} music videos`);
     } catch (err) {
       sourceCooldown.set(source, Date.now() + SOURCE_COOLDOWN);
       console.warn(`[radio] ${source} unavailable for 15 min: ${err.message}`);
@@ -419,6 +487,11 @@ const app = express();
 app.disable('x-powered-by');
 app.use(compression());
 
+const seedFrom = (req) => ({
+  artist: String(req.query.artist || '').trim().slice(0, 100),
+  title: String(req.query.title || '').trim().slice(0, 150),
+});
+
 const wrap = (fn) => async (req, res) => {
   try {
     res.json(await fn(req));
@@ -443,13 +516,38 @@ app.get(
   wrap(async (req) => {
     const id = String(req.query.id || '');
     if (!/^[\w-]{11}$/.test(id)) return { tracks: [] };
-    const seed = {
-      artist: String(req.query.artist || '').trim().slice(0, 100),
-      title: String(req.query.title || '').trim().slice(0, 150),
-    };
-    return cached(`r:${id}`, () => radio(id, seed));
+    return cached(`r:${id}`, () => radio(id, seedFrom(req)));
   })
 );
+
+// Diagnostics: runs every autoplay source for one video from this server and reports what each
+// returned or why it failed. Open /api/debug/radio?id=VIDEO_ID&artist=...&title=... on Render.
+app.get('/api/debug/radio', async (req, res) => {
+  const id = String(req.query.id || '');
+  if (!/^[\w-]{11}$/.test(id)) return res.status(400).json({ error: 'Pass ?id= with an 11-character video id' });
+  const seed = seedFrom(req);
+  const sources = [...RELATED_SOURCES, ['similar-artists', (videoId) => similarSongs(seed, videoId)]];
+  const report = [];
+  for (const [source, run] of sources) {
+    const started = Date.now();
+    try {
+      const tracks = await run(id);
+      report.push({
+        source,
+        ok: true,
+        ms: Date.now() - started,
+        tracks: tracks.length,
+        sample: tracks.slice(0, 5).map((t) => `${t.artist} - ${t.title}`),
+      });
+    } catch (err) {
+      report.push({ source, ok: false, ms: Date.now() - started, error: err.message });
+    }
+  }
+  const cooldowns = Object.fromEntries(
+    [...sourceCooldown].map(([source, until]) => [source, `${Math.max(0, Math.round((until - Date.now()) / 1000))}s left`])
+  );
+  res.json({ id, seed, cooldowns, report });
+});
 
 app.get(
   '/api/suggest',
