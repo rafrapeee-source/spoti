@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#000000">
+  <meta name="referrer" content="strict-origin-when-cross-origin">
+  <title>Spoti - Web Player</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='11' fill='%231ed760'/%3E%3Crect x='6.5' y='9' width='2.4' height='6' rx='1.2'/%3E%3Crect x='10.8' y='6.5' width='2.4' height='11' rx='1.2'/%3E%3Crect x='15.1' y='8' width='2.4' height='8' rx='1.2'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body data-route="home" data-vol="high">
+  <div id="app">
+    <aside class="sidebar">
+      <nav class="panel nav">
+        <a class="logo" href="#/"><span data-icon="logo"></span>Spoti</a>
+        <a class="nav-link" data-route-link="home" href="#/"><span data-icon="home"></span>Home</a>
+        <a class="nav-link" data-route-link="search" href="#/search"><span data-icon="search"></span>Search</a>
+      </nav>
+      <section class="panel library">
+        <a class="library-head nav-link" data-route-link="library" href="#/library"><span data-icon="library"></span>Your Library</a>
+        <div class="library-list" id="library-list"></div>
+      </section>
+    </aside>
+
+    <main class="main panel" id="main">
+      <header class="topbar">
+        <div class="history-btns">
+          <button class="round-btn" data-action="back" data-icon="chevLeft" aria-label="Go back"></button>
+          <button class="round-btn" data-action="forward" data-icon="chevRight" aria-label="Go forward"></button>
+        </div>
+        <form class="search-box" id="search-form" role="search" autocomplete="off">
+          <span data-icon="search"></span>
+          <input id="search-input" type="search" name="q" placeholder="What do you want to play?" aria-label="Search songs" enterkeyhint="search" spellcheck="false">
+          <button type="button" class="icon-btn" id="search-clear" data-icon="close" aria-label="Clear search" hidden></button>
+          <ul class="suggestions" id="suggestions" role="listbox" hidden></ul>
+        </form>
+      </header>
+      <div class="view" id="view"></div>
+    </main>
+
+    <aside class="queue-panel panel" id="queue-panel" aria-label="Queue" hidden>
+      <div class="queue-head">
+        <h2>Queue</h2>
+        <button class="icon-btn" data-action="close-queue" data-icon="close" aria-label="Close queue"></button>
+      </div>
+      <div id="queue-body"></div>
+    </aside>
+
+    <footer class="player-bar">
+      <div class="np" data-action="open-full">
+        <img class="np-art" data-np="art" alt="">
+        <div class="np-meta">
+          <div class="np-title" data-np="title"></div>
+          <div class="np-artist" data-np="artist"></div>
+        </div>
+        <button class="icon-btn like-btn" data-action="like-current" data-icon="heart" aria-label="Save to Liked Songs"></button>
+      </div>
+
+      <div class="controls">
+        <div class="buttons">
+          <button class="ctrl" data-action="shuffle" data-icon="shuffle" aria-label="Shuffle" title="Shuffle"></button>
+          <button class="ctrl" data-action="prev" data-icon="prev" aria-label="Previous" title="Previous"></button>
+          <button class="play-btn pp global" data-action="toggle" data-icon="play pause" aria-label="Play or pause" title="Play/Pause (Space)"></button>
+          <button class="ctrl" data-action="next" data-icon="next" aria-label="Next" title="Next"></button>
+          <button class="ctrl" data-action="repeat" data-icon="repeat" aria-label="Repeat song" title="Repeat song"></button>
+        </div>
+        <div class="progress-row">
+          <span class="time" data-time="cur">0:00</span>
+          <div class="slider" data-progress role="slider" tabindex="0" aria-label="Seek" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+            <div class="track"><div class="fill"></div></div><div class="knob"></div>
+          </div>
+          <span class="time" data-time="dur">0:00</span>
+        </div>
+      </div>
+
+      <div class="extras">
+        <button class="ctrl" data-action="queue" data-icon="queue" aria-label="Queue" title="Queue"></button>
+        <button class="ctrl vol-btn" data-action="mute" data-icon="volMute volLow volHigh" aria-label="Mute" title="Mute (M)"></button>
+        <div class="slider volume" data-volume role="slider" tabindex="0" aria-label="Volume" aria-valuemin="0" aria-valuemax="100" aria-valuenow="80">
+          <div class="track"><div class="fill"></div></div><div class="knob"></div>
+        </div>
+      </div>
+
+      <div class="mini-actions">
+        <button class="icon-btn like-btn" data-action="like-current" data-icon="heart" aria-label="Save to Liked Songs"></button>
+        <button class="icon-btn mini-toggle pp global" data-action="toggle" data-icon="play pause" aria-label="Play or pause"></button>
+      </div>
+      <div class="mini-progress" id="mini-progress"></div>
+    </footer>
+
+    <nav class="mobile-nav">
+      <a data-route-link="home" href="#/"><span data-icon="home"></span>Home</a>
+      <a data-route-link="search" href="#/search"><span data-icon="search"></span>Search</a>
+      <a data-route-link="library" href="#/library"><span data-icon="library"></span>Your Library</a>
+    </nav>
+  </div>
+
+  <div class="fullplayer" id="fullplayer" hidden>
+    <div class="fp-bg"></div>
+    <header class="fp-head">
+      <button class="icon-btn" data-action="close-full" data-icon="chevDown" aria-label="Close player"></button>
+      <span>Now playing</span>
+      <button class="icon-btn" data-action="queue" data-icon="queue" aria-label="Queue"></button>
+    </header>
+    <div class="fp-art-wrap"><div class="fp-art-box"><img class="art-hq" data-np="art" data-size="hq" alt=""></div></div>
+    <div class="fp-meta">
+      <div class="fp-text">
+        <div class="fp-title" data-np="title"></div>
+        <div class="fp-artist" data-np="artist"></div>
+      </div>
+      <button class="icon-btn like-btn" data-action="like-current" data-icon="heart" aria-label="Save to Liked Songs"></button>
+    </div>
+    <div class="slider" data-progress role="slider" tabindex="0" aria-label="Seek" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+      <div class="track"><div class="fill"></div></div><div class="knob"></div>
+    </div>
+    <div class="fp-times"><span data-time="cur">0:00</span><span data-time="dur">0:00</span></div>
+    <div class="fp-controls">
+      <button class="ctrl" data-action="shuffle" data-icon="shuffle" aria-label="Shuffle"></button>
+      <button class="ctrl" data-action="prev" data-icon="prev" aria-label="Previous"></button>
+      <button class="play-btn pp global" data-action="toggle" data-icon="play pause" aria-label="Play or pause"></button>
+      <button class="ctrl" data-action="next" data-icon="next" aria-label="Next"></button>
+      <button class="ctrl" data-action="repeat" data-icon="repeat" aria-label="Repeat song"></button>
+    </div>
+  </div>
+
+  <div class="menu" id="menu" role="menu" hidden></div>
+  <div class="toast" id="toast" role="status" hidden></div>
+  <div class="yt-host" id="yt-host" aria-hidden="true"></div>
+</body>
+</html>
