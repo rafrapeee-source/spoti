@@ -9,20 +9,18 @@ const PORT = process.env.PORT || 3000;
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 
-function clientConfig(host, clientName, clientId, clientVersion) {
+function clientConfig(host, clientName, clientId, clientVersion, { userAgent = USER_AGENT, app = false, client = {} } = {}) {
   return {
     url: `https://${host}/youtubei/v1`,
-    client: { clientName, clientVersion, hl: 'en', gl: 'US' },
+    client: { clientName, clientVersion, hl: 'en', gl: 'US', ...client },
     headers: {
       'Content-Type': 'application/json',
-      'User-Agent': USER_AGENT,
+      'User-Agent': userAgent,
       'Accept-Language': 'en-US,en;q=0.9',
       'X-YouTube-Client-Name': clientId,
       'X-YouTube-Client-Version': clientVersion,
-      Origin: `https://${host}`,
-      Referer: `https://${host}/`,
-      // Skips the EU consent interstitial.
-      Cookie: 'CONSENT=YES+1; SOCS=CAI',
+      // Browser-only headers; phone apps don't send these. The cookie skips the EU consent page.
+      ...(app ? {} : { Origin: `https://${host}`, Referer: `https://${host}/`, Cookie: 'CONSENT=YES+1; SOCS=CAI' }),
     },
   };
 }
@@ -30,6 +28,18 @@ function clientConfig(host, clientName, clientId, clientVersion) {
 const CLIENTS = {
   web: clientConfig('www.youtube.com', 'WEB', '1', '2.20250910.00.00'),
   music: clientConfig('music.youtube.com', 'WEB_REMIX', '67', '1.20250910.01.00'),
+  // YouTube Music's phone apps, which use Google's API host. Google often blocks per client,
+  // so /api/debug/related tests whether these get through where the website client doesn't.
+  musicAndroid: clientConfig('youtubei.googleapis.com', 'ANDROID_MUSIC', '21', '7.27.52', {
+    app: true,
+    userAgent: 'com.google.android.apps.youtube.music/7.27.52 (Linux; U; Android 14) gzip',
+    client: { androidSdkVersion: 34, osName: 'Android', osVersion: '14', platform: 'MOBILE' },
+  }),
+  musicIos: clientConfig('youtubei.googleapis.com', 'IOS_MUSIC', '26', '7.27.0', {
+    app: true,
+    userAgent: 'com.google.ios.youtubemusic/7.27.0 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)',
+    client: { deviceMake: 'Apple', deviceModel: 'iPhone16,2', osName: 'iPhone', osVersion: '17.5.1.21F90', platform: 'MOBILE' },
+  }),
 };
 
 // Reusing the visitor id YouTube hands out makes follow-up requests look like one browser session.
@@ -55,10 +65,11 @@ function cached(key, fn) {
   return value;
 }
 
-async function innertube(endpoint, body, { kind = 'web', timeout = 12000 } = {}) {
+async function innertube(endpoint, body, { kind = 'web', timeout = 12000, fresh = false } = {}) {
   const { url, client, headers } = CLIENTS[kind];
   for (let attempt = 0; ; attempt++) {
-    const visitor = visitorData;
+    // `fresh` sends the request without the reused visitor id, like a first-time visitor.
+    const visitor = fresh ? null : visitorData;
     const res = await fetch(`${url}/${endpoint}?prettyPrint=false`, {
       method: 'POST',
       headers: visitor ? { ...headers, 'X-Goog-Visitor-Id': visitor } : headers,
@@ -399,22 +410,27 @@ async function ytmusicRadio(videoId, seed, trace) {
 const ytmusicBrowse = (browseId) =>
   cached(`ytm:b:${browseId}`, () => innertube('browse', { browseId }, { kind: 'music', timeout: YTMUSIC_TIMEOUT }));
 
+// A song row in a YouTube Music list (artist page top songs, Related tab shelves).
+function fromMusicListItem(r, fallbackArtist = '') {
+  const columns = (r.flexColumns || []).map((c) => text(c.musicResponsiveListItemFlexColumnRenderer?.text));
+  // The second column is "Artist • Album", sometimes prefixed with the item type ("Song • Artist").
+  const parts = String(columns[1] || '').split(' • ');
+  const byline = (/^(song|video|single|ep)$/i.test(parts[0]) ? parts[1] : parts[0])?.trim();
+  return musicTrack({
+    videoId: r.playlistItemData?.videoId || collect(r, 'watchEndpoint')[0]?.videoId,
+    title: columns[0],
+    artist: byline && !/\b(plays|views)\b/i.test(byline) ? byline : fallbackArtist,
+    durationText:
+      (r.fixedColumns || [])
+        .map((c) => text(c.musicResponsiveListItemFixedColumnRenderer?.text))
+        .find((t) => /^\d+(:\d{2})+$/.test(t)) || '',
+  });
+}
+
 // The top songs listed on a YouTube Music artist page.
 function topSongs(page, artistName) {
   return collect(collect(page, 'musicShelfRenderer')[0], 'musicResponsiveListItemRenderer')
-    .map((r) => {
-      const columns = (r.flexColumns || []).map((c) => text(c.musicResponsiveListItemFlexColumnRenderer?.text));
-      const byline = firstPart(columns[1]);
-      return musicTrack({
-        videoId: r.playlistItemData?.videoId || collect(r, 'watchEndpoint')[0]?.videoId,
-        title: columns[0],
-        artist: byline && !/\b(plays|views)\b/i.test(byline) ? byline : artistName,
-        durationText:
-          (r.fixedColumns || [])
-            .map((c) => text(c.musicResponsiveListItemFixedColumnRenderer?.text))
-            .find((t) => /^\d+(:\d{2})+$/.test(t)) || '',
-      });
-    })
+    .map((r) => fromMusicListItem(r, artistName))
     .filter(Boolean);
 }
 
@@ -476,6 +492,22 @@ async function ytmusic(videoId, seed) {
   const { tracks, source, failures } = await firstWorking(YTMUSIC_SOURCES, videoId, seed);
   if (!source) throw new Error(failures.join(' | '));
   return { tracks, source };
+}
+
+/* ---------------- YouTube Music "Related" tab (experiment) ---------------- */
+
+// The Related tab's ID ("MPTR…") is only given out in a song's `next` response.
+const relatedTabId = (data) =>
+  collect(data, 'browseEndpoint')
+    .map((b) => b.browseId)
+    .find((id) => typeof id === 'string' && id.startsWith('MPTR'));
+
+// Songs from the Related tab's "You might also like" shelf.
+function relatedTabSongs(page) {
+  const shelf = collect(page, 'musicCarouselShelfRenderer').find((s) =>
+    /you might also like/i.test(collect(s.header, 'title').map(text).join(' '))
+  );
+  return dedupe(collect(shelf?.contents, 'musicResponsiveListItemRenderer').map((r) => fromMusicListItem(r)));
 }
 
 /* ---------------- radio ---------------- */
@@ -684,6 +716,58 @@ app.get(
     return { suggestions: await cached(`q:${q}`, () => suggest(q)) };
   })
 );
+
+// Experiment: can any YouTube Music client load a song's "Related" tab from this server?
+// For each client (website, Android app, iPhone app) it makes the song's `next` request, which
+// holds the radio queue and the Related tab's ID, then loads the Related tab with that ID.
+// Open /api/debug/related?id=VIDEO_ID on Render.
+app.get('/api/debug/related', async (req, res) => {
+  const id = String(req.query.id || '');
+  if (!/^[\w-]{11}$/.test(id)) return res.status(400).json({ error: 'Pass ?id= with an 11-character video id' });
+  const report = [];
+  for (const kind of ['music', 'musicAndroid', 'musicIos']) {
+    const entry = { client: CLIENTS[kind].client.clientName };
+    let started = Date.now();
+    try {
+      const data = await innertube(
+        'next',
+        { videoId: id, playlistId: `RDAMVM${id}`, isAudioOnly: true, enablePersistentPlaylistPanel: true },
+        { kind, timeout: 8000, fresh: true }
+      );
+      entry.next = {
+        ok: true,
+        ms: Date.now() - started,
+        radioQueueSongs: collect(data, 'playlistPanelVideoRenderer').length,
+        shape: shapeOf(data),
+      };
+      entry.relatedTabId = relatedTabId(data) || null;
+      if (entry.relatedTabId) {
+        entry.relatedTab = [];
+        for (const browseKind of new Set(['music', kind])) {
+          started = Date.now();
+          try {
+            const page = await innertube('browse', { browseId: entry.relatedTabId }, { kind: browseKind, timeout: 8000 });
+            const songs = relatedTabSongs(page);
+            entry.relatedTab.push({
+              via: CLIENTS[browseKind].client.clientName,
+              ok: true,
+              ms: Date.now() - started,
+              songs: songs.length,
+              sample: songs.slice(0, 6).map((s) => `${s.artist} - ${s.title}`),
+              shape: shapeOf(page),
+            });
+          } catch (err) {
+            entry.relatedTab.push({ via: CLIENTS[browseKind].client.clientName, ok: false, ms: Date.now() - started, error: err.message });
+          }
+        }
+      }
+    } catch (err) {
+      entry.next = { ok: false, ms: Date.now() - started, error: err.message };
+    }
+    report.push(entry);
+  }
+  res.json({ id, report });
+});
 
 app.get('/api/thumb/:id', async (req, res) => {
   const { id } = req.params;

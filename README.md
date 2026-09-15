@@ -37,6 +37,8 @@ The browser never contacts `www.youtube.com` or `i.ytimg.com`. Search results, s
 
 Open `https://<your-app>.onrender.com/api/debug/radio?id=VIDEO_ID&artist=ARTIST&title=TITLE`. It runs every autoplay source from the server and shows, for each one, how many songs it returned or why it failed.
 
+`/api/debug/related?id=VIDEO_ID` is an experiment. It checks whether YouTube Music's song-based "Related" tab can be loaded from the server using the website, Android app or iPhone app client. For each client it shows whether the song request was blocked and whether the Related tab's songs could be read.
+
 ## Run locally
 
 ```
