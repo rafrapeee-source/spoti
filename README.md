@@ -6,7 +6,7 @@ A Spotify-style web player. Search results come from YouTube, and songs play thr
 
 - **Search**: YouTube search with suggestions as you type, a top result, and more results that load as you scroll.
 - **Queue**: *Play*, *Add to queue*, *Play next*, and removing or jumping to songs in the queue panel.
-- **Autoplay**: when your queue runs out, related songs keep playing, like Spotify's radio: songs by the same artist and similar artists, from Deezer's artist radio. Each song is matched to its official YouTube upload. When recommendations run out, a new radio starts from whatever is playing, so the music drifts naturally. If Deezer can't be reached, the server tries YouTube's related videos instead.
+- **Autoplay**: when your queue runs out, related songs keep playing, like Spotify's radio. They come from YouTube Music's song radio ("Start radio"), or from YouTube Music's "Fans might also like" artists if the radio isn't available. When recommendations run out, a new radio starts from whatever is playing, so the music drifts naturally. If YouTube Music can't be reached from the server, Deezer's artist radio is used as a backup.
 - **Controls**: play/pause, seek (drag or arrow keys), next/previous, shuffle, repeat song, volume and mute.
 - **Library**: Liked Songs and Recently played, saved in the browser's localStorage.
 - **Mobile layout**: a mini player plus a full-screen player.
@@ -15,14 +15,14 @@ A Spotify-style web player. Search results come from YouTube, and songs play thr
 ## How it works
 
 ```
-Browser ──► Render (server.js) ──► YouTube (search, song matching, suggestions, thumbnails)
+Browser ──► Render (server.js) ──► YouTube + YouTube Music (search, song radio, suggestions, thumbnails)
    │
-   ├──► Deezer API (song recommendations, via JSONP)
+   ├──► Deezer API (backup song recommendations, via JSONP)
    │
    └──► youtube-nocookie.com embed (hidden 200×200 iframe = lowest quality / 144p)
 ```
 
-The browser never contacts `www.youtube.com` or `i.ytimg.com`. Search results and thumbnails go through the server. Recommendations are fetched from Deezer by the browser, because YouTube and Deezer both block most requests from cloud servers like Render (YouTube search is the exception). The player is driven with the embed's postMessage API directly, so the `iframe_api` script isn't needed.
+The browser never contacts `www.youtube.com` or `i.ytimg.com`. Search results, song radio and thumbnails go through the server. Deezer is only contacted, by the browser, when YouTube Music's radio can't be reached from the server. The player is driven with the embed's postMessage API directly, so the `iframe_api` script isn't needed.
 
 ## Deploy to Render
 

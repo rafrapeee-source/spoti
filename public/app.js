@@ -308,7 +308,8 @@ function appendAutoplay(tracks, gen) {
   const allowVariants = VARIANT.test(state.current?.track.rawTitle || '');
   const fresh = [];
   for (const t of tracks) {
-    if (!t.duration || t.duration > MAX_SONG_SECONDS) continue;
+    // Songs from YouTube Music artist pages may come without a duration, so only long ones are skipped.
+    if (t.duration > MAX_SONG_SECONDS) continue;
     if (state.played.has(t.id) || taken.has(t.id)) continue;
     if ((!allowVariants && VARIANT.test(t.rawTitle)) || isRepeat(t, keys)) continue;
     keys.add(songKey(t));
@@ -391,9 +392,10 @@ async function matchPending(gen) {
   return appendAutoplay(tracks.filter(Boolean), gen);
 }
 
-// Keeps "Next up" stocked with a few songs at a time. When the recommendations run out, a new
-// radio starts from whatever is playing then, so the music drifts naturally like Spotify's.
-// If Deezer can't be reached, the server's own YouTube-based lookup is used instead.
+// Keeps "Next up" stocked. Recommendations come from YouTube Music's song radio (through our
+// server). Only if YouTube Music isn't reachable from the server is Deezer's artist radio used,
+// and as a last resort the server's YouTube lookup. When recommendations run out, a new radio
+// starts from whatever is playing then, so the music drifts naturally like Spotify's.
 function ensureRadio() {
   const seed = state.current?.track;
   if (!seed) return Promise.resolve();
@@ -406,12 +408,20 @@ function ensureRadio() {
     try {
       if (!state.pending.length) {
         state.radioSeeds.add(seed.id);
+        const params = new URLSearchParams({ id: seed.id, artist: seed.artist, title: seed.title });
+        let added = 0;
         try {
-          await loadDeezerRadio(seed, gen);
+          added = appendAutoplay((await api(`/api/ytmusic/radio?${params}`)).tracks, gen);
         } catch (err) {
-          console.warn('Deezer radio unavailable, using server lookup:', err.message);
-          const params = new URLSearchParams({ id: seed.id, artist: seed.artist, title: seed.title });
-          appendAutoplay((await api(`/api/radio?${params}`)).tracks, gen);
+          console.warn('YouTube Music radio unavailable, trying Deezer:', err.message);
+        }
+        if (!added && gen === state.radioGen) {
+          try {
+            await loadDeezerRadio(seed, gen);
+          } catch (err) {
+            console.warn('Deezer radio unavailable, using server lookup:', err.message);
+            appendAutoplay((await api(`/api/radio?${params}`)).tracks, gen);
+          }
         }
       }
       while (gen === state.radioGen && state.autoplay.length < 4 && state.pending.length) {

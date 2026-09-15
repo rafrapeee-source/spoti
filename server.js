@@ -262,6 +262,15 @@ function sameSong(track, seed) {
   return songKey(track.title) === key || (key.length >= 6 && norm(track.rawTitle).includes(key));
 }
 
+function shuffled(list) {
+  const a = [...list];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
 async function mapLimit(items, limit, fn) {
   const out = new Array(items.length);
   let next = 0;
@@ -299,6 +308,167 @@ async function findOnYouTube(artist, title, duration = 0) {
     }
   }
   return best && { ...best, title, artist };
+}
+
+/* ---------------- YouTube Music ---------------- */
+
+const YTMUSIC_TIMEOUT = 8000;
+
+// "The Weeknd • After Hours • 2020" -> "The Weeknd"
+const firstPart = (s) => String(s || '').split(' • ')[0].trim();
+
+// YouTube Music already separates title and artist, so no "Artist - Title" parsing is needed.
+function musicTrack({ videoId, title, artist, durationText = '' }) {
+  if (!videoId || !title) return null;
+  return {
+    id: videoId,
+    title,
+    artist,
+    rawTitle: artist ? `${artist} - ${title}` : title,
+    channel: artist,
+    duration: parseDuration(durationText),
+    durationText,
+    thumbnail: thumb(videoId),
+  };
+}
+
+// Counts of the renderers YouTube Music responses are parsed from, reported by /api/debug/radio
+// so parsing can be fixed from the deployed server's real responses.
+function shapeOf(data) {
+  const keys = [
+    'playlistPanelVideoRenderer',
+    'musicResponsiveListItemRenderer',
+    'musicTwoRowItemRenderer',
+    'musicCarouselShelfRenderer',
+    'musicShelfRenderer',
+    'musicCardShelfRenderer',
+  ];
+  return {
+    topLevel: Object.keys(data || {}),
+    ...Object.fromEntries(keys.map((k) => [k, collect(data, k).length])),
+    shelves: collect(data, 'musicCarouselShelfBasicHeaderRenderer').map((h) => text(h.title)),
+  };
+}
+
+function artistLinks(node) {
+  const seen = new Set();
+  const out = [];
+  for (const run of collect(node, 'runs').flat()) {
+    const browse = run?.navigationEndpoint?.browseEndpoint;
+    const pageType = browse?.browseEndpointContextSupportedConfigs?.browseEndpointContextMusicConfig?.pageType;
+    const isArtist = pageType ? pageType === 'MUSIC_PAGE_TYPE_ARTIST' : browse?.browseId?.startsWith('UC');
+    if (!isArtist || !run.text || seen.has(browse.browseId)) continue;
+    seen.add(browse.browseId);
+    out.push({ name: run.text, browseId: browse.browseId });
+  }
+  return out;
+}
+
+// "Start radio" on YouTube Music: an endless queue of songs like this one.
+async function ytmusicRadio(videoId, seed, trace) {
+  const data = await innertube(
+    'next',
+    {
+      videoId,
+      playlistId: `RDAMVM${videoId}`,
+      isAudioOnly: true,
+      enablePersistentPlaylistPanel: true,
+      tunerSettingValue: 'AUTOMIX_SETTING_NORMAL',
+      watchEndpointMusicSupportedConfigs: {
+        watchEndpointMusicConfig: { hasPersistentPlaylistPanel: true, musicVideoType: 'MUSIC_VIDEO_TYPE_ATV' },
+      },
+    },
+    { kind: 'music', timeout: YTMUSIC_TIMEOUT }
+  );
+  trace?.push({ step: 'radio queue', shape: shapeOf(data) });
+  const tracks = collect(data, 'playlistPanelVideoRenderer').map((v) =>
+    musicTrack({
+      videoId: v.videoId,
+      title: text(v.title),
+      artist: firstPart(text(v.shortBylineText) || text(v.longBylineText)),
+      durationText: text(v.lengthText),
+    })
+  );
+  return dedupe(tracks).filter((t) => t.id !== videoId);
+}
+
+const ytmusicBrowse = (browseId) =>
+  cached(`ytm:b:${browseId}`, () => innertube('browse', { browseId }, { kind: 'music', timeout: YTMUSIC_TIMEOUT }));
+
+// The top songs listed on a YouTube Music artist page.
+function topSongs(page, artistName) {
+  return collect(collect(page, 'musicShelfRenderer')[0], 'musicResponsiveListItemRenderer')
+    .map((r) => {
+      const columns = (r.flexColumns || []).map((c) => text(c.musicResponsiveListItemFlexColumnRenderer?.text));
+      const byline = firstPart(columns[1]);
+      return musicTrack({
+        videoId: r.playlistItemData?.videoId || collect(r, 'watchEndpoint')[0]?.videoId,
+        title: columns[0],
+        artist: byline && !/\b(plays|views)\b/i.test(byline) ? byline : artistName,
+        durationText:
+          (r.fixedColumns || [])
+            .map((c) => text(c.musicResponsiveListItemFixedColumnRenderer?.text))
+            .find((t) => /^\d+(:\d{2})+$/.test(t)) || '',
+      });
+    })
+    .filter(Boolean);
+}
+
+function similarArtists(page) {
+  const shelf = collect(page, 'musicCarouselShelfRenderer').find((s) =>
+    /fans might also like|similar artists/i.test(collect(s.header, 'title').map(text).join(' '))
+  );
+  return shelf ? artistLinks(shelf.contents) : [];
+}
+
+// Used when the radio isn't available: the artist's "Fans might also like" artists on YouTube Music,
+// two top songs from each, with the artist's own hits mixed in.
+async function ytmusicArtistRadio(videoId, seed, trace) {
+  const query = `${stripExtras(seed.artist)} ${stripExtras(seed.title)}`.trim();
+  if (!query) throw new Error('no artist or title to search for');
+  const results = await cached(`ytm:s:${query}`, () =>
+    innertube('search', { query }, { kind: 'music', timeout: YTMUSIC_TIMEOUT })
+  );
+  trace?.push({ step: 'search', shape: shapeOf(results) });
+
+  const artistKey = norm(stripExtras(seed.artist));
+  const links = artistLinks(results);
+  const artist =
+    links.find((a) => {
+      const name = norm(a.name);
+      return artistKey && name && (name.includes(artistKey) || artistKey.includes(name));
+    }) || links[0];
+  if (!artist) throw new Error('artist not found on YouTube Music');
+
+  const page = await ytmusicBrowse(artist.browseId);
+  trace?.push({ step: `artist page: ${artist.name}`, shape: shapeOf(page) });
+  const similar = similarArtists(page).filter((a) => a.browseId !== artist.browseId).slice(0, 8);
+  const own = shuffled(topSongs(page, artist.name).filter((t) => t.id !== videoId && !sameSong(t, seed))).slice(0, 4);
+  const theirs = await mapLimit(similar, 4, (a) =>
+    ytmusicBrowse(a.browseId)
+      .then((p) => shuffled(topSongs(p, a.name).slice(0, 5)).slice(0, 2))
+      .catch(() => [])
+  );
+  trace?.push({ step: 'similar artists', artists: similar.map((a) => a.name), songsEach: theirs.map((s) => s.length) });
+
+  const tracks = [];
+  theirs.forEach((songs, i) => {
+    tracks.push(...songs);
+    if (i % 2 === 1 && own.length) tracks.push(own.shift());
+  });
+  tracks.push(...own);
+  return dedupe(tracks);
+}
+
+const YTMUSIC_SOURCES = [
+  ['ytmusic-radio', ytmusicRadio],
+  ['ytmusic-artists', ytmusicArtistRadio],
+];
+
+async function ytmusic(videoId, seed) {
+  const { tracks, source, failures } = await firstWorking(YTMUSIC_SOURCES, videoId, seed);
+  if (!source) throw new Error(failures.join(' | '));
+  return { tracks, source };
 }
 
 /* ---------------- radio ---------------- */
@@ -345,10 +515,6 @@ const RADIO_TIMEOUT = 5000;
 const RELATED_SOURCES = [
   ['youtube', (videoId) => innertube('next', { videoId, playlistId: `RD${videoId}` }, { timeout: RADIO_TIMEOUT })],
   ['watch-page', (videoId) => watchPage(videoId)],
-  [
-    'youtube-music',
-    (videoId) => innertube('next', { videoId, playlistId: `RDAMVM${videoId}` }, { kind: 'music', timeout: RADIO_TIMEOUT }),
-  ],
 ].map(([source, fetchData]) => [source, async (videoId) => relatedMusic(await fetchData(videoId), videoId)]);
 
 // A source YouTube refuses from this server is skipped for a while, so later lookups
@@ -356,23 +522,30 @@ const RELATED_SOURCES = [
 const SOURCE_COOLDOWN = 15 * 60 * 1000;
 const sourceCooldown = new Map();
 
-async function radio(videoId, seed) {
+// Tries sources in order and returns the first one with at least 3 songs.
+async function firstWorking(sources, videoId, seed) {
   const failures = [];
-  for (const [source, run] of RELATED_SOURCES) {
+  for (const [source, run] of sources) {
     if ((sourceCooldown.get(source) || 0) > Date.now()) {
       failures.push(`${source}: skipped, failed recently`);
       continue;
     }
     try {
-      const tracks = await run(videoId);
-      if (tracks.length >= 3) return { tracks, source };
-      failures.push(`${source}: only ${tracks.length} music videos`);
+      const tracks = await run(videoId, seed);
+      if (tracks.length >= 3) return { tracks, source, failures };
+      failures.push(`${source}: only ${tracks.length} songs`);
     } catch (err) {
       sourceCooldown.set(source, Date.now() + SOURCE_COOLDOWN);
-      console.warn(`[radio] ${source} unavailable for 15 min: ${err.message}`);
+      console.warn(`[autoplay] ${source} unavailable for 15 min: ${err.message}`);
       failures.push(`${source}: ${err.message}`);
     }
   }
+  return { tracks: [], source: null, failures };
+}
+
+async function radio(videoId, seed) {
+  const { tracks, source, failures } = await firstWorking(RELATED_SOURCES, videoId, seed);
+  if (source) return { tracks, source };
 
   if (seed.artist) {
     try {
@@ -438,6 +611,16 @@ app.get(
   })
 );
 
+// Song radio from YouTube Music, used first by the browser's autoplay.
+app.get(
+  '/api/ytmusic/radio',
+  wrap(async (req) => {
+    const id = String(req.query.id || '');
+    if (!/^[\w-]{11}$/.test(id)) return { tracks: [] };
+    return cached(`ytm:r:${id}`, () => ytmusic(id, seedFrom(req)));
+  })
+);
+
 // Matches songs recommended in the browser (artist + title from Deezer) to their official YouTube
 // uploads. YouTube search works from this server even when YouTube's other endpoints don't.
 app.post(
@@ -463,19 +646,21 @@ app.get('/api/debug/radio', async (req, res) => {
   if (!/^[\w-]{11}$/.test(id)) return res.status(400).json({ error: 'Pass ?id= with an 11-character video id' });
   const seed = seedFrom(req);
   const report = [];
-  for (const [source, run] of RELATED_SOURCES) {
+  for (const [source, run] of [...YTMUSIC_SOURCES, ...RELATED_SOURCES]) {
     const started = Date.now();
+    const trace = [];
     try {
-      const tracks = await run(id);
+      const tracks = await run(id, seed, trace);
       report.push({
         source,
         ok: true,
         ms: Date.now() - started,
         tracks: tracks.length,
         sample: tracks.slice(0, 5).map((t) => `${t.artist} - ${t.title}`),
+        trace,
       });
     } catch (err) {
-      report.push({ source, ok: false, ms: Date.now() - started, error: err.message });
+      report.push({ source, ok: false, ms: Date.now() - started, error: err.message, trace });
     }
   }
   const cooldowns = Object.fromEntries(
