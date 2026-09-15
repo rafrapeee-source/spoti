@@ -77,7 +77,11 @@ async function innertube(endpoint, body, { kind = 'web', timeout = 12000 } = {})
     let reason = raw.slice(0, 160);
     try {
       reason = JSON.parse(raw).error?.message || reason;
-    } catch {}
+    } catch {
+      // HTML error pages, like Google's "Sorry..." bot check, are reduced to their title.
+      const title = raw.match(/<title>([^<]*)<\/title>/i)?.[1];
+      if (title) reason = /^sorry/i.test(title) ? 'blocked by Google bot check' : title;
+    }
     throw new Error(`${kind} ${endpoint} HTTP ${res.status}${reason ? `: ${reason}` : ''}`);
   }
 }
@@ -460,9 +464,12 @@ async function ytmusicArtistRadio(videoId, seed, trace) {
   return dedupe(tracks);
 }
 
+// Artist pages come first: from Render, Google blocks YouTube Music's radio request with its bot
+// check, while search and artist pages keep working. Trying the radio first made autoplay wait for
+// it to time out every time its cooldown ended.
 const YTMUSIC_SOURCES = [
-  ['ytmusic-radio', ytmusicRadio],
   ['ytmusic-artists', ytmusicArtistRadio],
+  ['ytmusic-radio', ytmusicRadio],
 ];
 
 async function ytmusic(videoId, seed) {
