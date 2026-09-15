@@ -392,9 +392,9 @@ async function matchPending(gen) {
   return appendAutoplay(tracks.filter(Boolean), gen);
 }
 
-// Keeps "Next up" stocked. Recommendations come from YouTube Music's song radio (through our
+// Keeps "Next up" stocked. Recommendations come from YouTube Music artist pages (through our
 // server). Only if YouTube Music isn't reachable from the server is Deezer's artist radio used,
-// and as a last resort the server's YouTube lookup. When recommendations run out, a new radio
+// and as a last resort other songs by the same artist. When recommendations run out, a new radio
 // starts from whatever is playing then, so the music drifts naturally like Spotify's.
 function ensureRadio() {
   const seed = state.current?.track;
@@ -413,13 +413,13 @@ function ensureRadio() {
         try {
           added = appendAutoplay((await api(`/api/ytmusic/radio?${params}`)).tracks, gen);
         } catch (err) {
-          console.warn('YouTube Music radio unavailable, trying Deezer:', err.message);
+          console.warn('YouTube Music recommendations unavailable, trying Deezer:', err.message);
         }
         if (!added && gen === state.radioGen) {
           try {
             await loadDeezerRadio(seed, gen);
           } catch (err) {
-            console.warn('Deezer radio unavailable, using server lookup:', err.message);
+            console.warn('Deezer radio unavailable, using songs by the same artist:', err.message);
             appendAutoplay((await api(`/api/radio?${params}`)).tracks, gen);
           }
         }
