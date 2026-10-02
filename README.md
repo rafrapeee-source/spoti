@@ -1,18 +1,18 @@
 # Spoti
 
-A Spotify-style web player. Search results come from YouTube, and songs play through a hidden `youtube-nocookie.com` embed.
+A Spotify-style web player. Everything you see (songs, artists, albums, charts, cover art) comes from Deezer's free API. Deezer only offers 30-second previews, so each song plays from its upload on YouTube, through a hidden `youtube-nocookie.com` embed.
 
 ## Features
 
-- **Search**: YouTube search with suggestions as you type, a top result, and more results that load as you scroll.
-- **Queue**: *Play*, *Add to queue*, *Play next*, and removing or jumping to songs in the queue panel.
-- **Autoplay**: when your queue runs out, related songs keep playing, like Spotify's radio. They come from YouTube Music: top songs from the artist's "Fans might also like" artists and a few artists further out, mixed with the artist's own hits. Like Spotify:
+- **Search**: songs, artists and albums from Deezer, with instant results as you type (pick an artist to open their page, or a song to play it), a top result, and more songs that load as you scroll.
+- **Artist pages**: popular songs, discography and "Fans also like".
+- **Album pages** and **genre charts**, plus the top songs, artists and albums right now on Home.
+- **Queue**: *Play*, *Add to queue*, *Play next*, *Go to artist/album*, and removing or jumping to songs in the queue panel.
+- **Autoplay**: when your queue runs out, related songs keep playing, like Spotify's radio. They come from Deezer's artist radio (the artist's songs and similar artists'), mixed with the artist's own hits and, for later refills, a related artist's radio. Like Spotify:
   - it's ordered like a radio station: sometimes a short run of 2–3 songs by one artist, but an artist never comes back within 3 songs by accident, and shuffle doesn't scramble it;
-  - it stays close to what you started from: refills alternate between the song (or playlist) you started with and songs you've since played to the end or saved;
+  - it stays close to what you started from: refills alternate between the song (or list) you started with and songs you've since played to the end or saved;
   - it learns: skipping a recommendation in its first 30 seconds means less of that artist (none after a second skip), and finishing songs or saving them counts for the artist, remembered between visits;
   - it mixes in your Liked Songs now and then, when their artist is part of the mix.
-
-  If YouTube Music can't be reached from the server, Deezer's artist radio is used as a backup.
 - **Picks up where you left off**: what's playing, the queue and Next up are saved in the browser and restored (paused) on reload.
 - **Controls**: play/pause, seek (drag or arrow keys), next/previous, shuffle, repeat song, volume and mute.
 - **Library**: Liked Songs, saved in the browser's localStorage.
@@ -22,16 +22,19 @@ A Spotify-style web player. Search results come from YouTube, and songs play thr
 ## How it works
 
 ```
-Browser ──► Render (server.js) ──► YouTube + YouTube Music (search, artist pages, suggestions, thumbnails)
+Browser ──► Deezer API, via JSONP (search, artists, albums, charts, recommendations)
+   │        + Deezer's image CDN (cover art, artist photos)
    │
-   ├──► Deezer API (backup song recommendations, via JSONP)
+   ├──► Render (server.js) ──► YouTube search (finds each song's upload)
    │
    └──► youtube-nocookie.com embed (hidden 200×200 iframe = lowest quality / 144p)
 ```
 
-The browser never contacts `www.youtube.com` or `i.ytimg.com`. Search results, recommendations and thumbnails go through the server. Deezer is only contacted, by the browser, when YouTube Music can't be reached from the server.
+Deezer is called from the browser because it blocks requests from cloud servers like Render (and sends no CORS headers, hence JSONP).
 
-YouTube Music's song radio and song-based "Related" tab aren't used: Google blocks the request they depend on from cloud servers like Render, for the website and the phone app clients alike. YouTube's related videos and Mix are blocked the same way. The player is driven with the embed's postMessage API directly, so the `iframe_api` script isn't needed.
+When a song is about to play, the server searches YouTube for it and picks the official upload: the artist's name in the title or channel, the same title (or exactly the same length, for translated titles), preferring auto-generated "Topic" channels and VEVO, and never covers, karaoke or remixes unless the song is one. The browser remembers each match, and looks up the next song while the current one plays, so there's no pause between songs. If a video can't be played outside YouTube, the next-best upload is tried.
+
+The browser never contacts `www.youtube.com` or `i.ytimg.com`. The player is driven with the embed's postMessage API directly, so the `iframe_api` script isn't needed. Songs liked before the switch to Deezer are YouTube videos, and still play and show their thumbnails (through the server).
 
 ## Deploy to Render
 
@@ -42,9 +45,10 @@ YouTube Music's song radio and song-based "Related" tab aren't used: Google bloc
    - Start command: `npm start`
 3. Open the `.onrender.com` URL.
 
-## Troubleshooting autoplay
+## Troubleshooting playback
 
-Open `https://<your-app>.onrender.com/api/debug/radio?id=VIDEO_ID&artist=ARTIST&title=TITLE`. It runs every autoplay source from the server and shows, for each one, how many songs it returned or why it failed.
+If a song plays the wrong version or gets skipped, open `https://<your-app>.onrender.com/api/debug/match?artist=ARTIST&title=TITLE&duration=SECONDS`. It shows the YouTube results for that song and how each one was scored.
+
 ## Run locally
 
 ```

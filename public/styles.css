@@ -113,8 +113,12 @@ body.queue-open #app {
   box-shadow: 0 16px 32px rgba(0, 0, 0, 0.6);
 }
 .suggestions li { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 4px; color: var(--text); cursor: pointer; }
-.suggestions li .ic { width: 16px; height: 16px; color: var(--sub); }
 .suggestions li:hover, .suggestions li.active { background: #3e3e3e; }
+.sug-art { width: 40px; height: 40px; border-radius: 4px; object-fit: cover; flex: none; background: #3e3e3e; }
+.sug-text { min-width: 0; }
+.sug-title, .sug-sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sug-sub { font-size: 13px; color: var(--sub); }
+.round { border-radius: 50% !important; }
 
 /* ---------- views ---------- */
 .view { padding: 8px 24px 40px; }
@@ -150,11 +154,31 @@ body.queue-open #app {
   border-radius: 8px; background: var(--c); font-size: 22px; font-weight: 800;
   transition: filter .2s;
 }
-.genre::after {
-  content: ''; position: absolute; width: 90px; height: 90px; right: -18px; bottom: -14px;
-  background: rgba(0, 0, 0, .22); border-radius: 6px; transform: rotate(25deg);
+.genre img {
+  position: absolute; width: 90px; height: 90px; right: -16px; bottom: -10px;
+  border-radius: 6px; transform: rotate(25deg); box-shadow: 0 4px 12px rgba(0, 0, 0, .4);
 }
 .genre:hover { filter: brightness(1.12); }
+
+/* album and artist tiles */
+.section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; }
+.section-head .link-btn { margin-top: 0; }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px; margin: 0 -12px; }
+.card { position: relative; min-width: 0; padding: 12px; border-radius: 8px; transition: background .2s; }
+.card:hover { background: #1f1f1f; }
+.card-art { position: relative; margin-bottom: 10px; }
+.card-art img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 6px; background: #282828; box-shadow: 0 8px 24px rgba(0, 0, 0, .5); }
+.artist-card .card-art img { border-radius: 50%; }
+.card-title, .card-sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.card-title { font-weight: 700; }
+.card-sub { font-size: 13px; color: var(--sub); margin-top: 2px; }
+.card .card-play { right: 8px; bottom: 8px; }
+.card:hover .card-play { opacity: 1; transform: none; }
+.card .card-play:hover { transform: scale(1.06); background: var(--accent-hover); }
+
+.row-artist a:hover, .top-sub a:hover, .playlist-meta a:hover { color: var(--text); text-decoration: underline; }
+.charts-art { background: linear-gradient(135deg, #1e3264, #477d95); display: grid; place-items: center; color: #fff; }
+.quick-art.charts-art .ic { width: 26px; height: 26px; }
 
 .welcome { margin-top: 32px; padding: 32px; border-radius: 8px; background: linear-gradient(135deg, #1e3a2a, #121212); }
 .welcome h2 { font-size: 24px; margin-bottom: 8px; }
@@ -164,7 +188,7 @@ body.queue-open #app {
 
 /* search results */
 .search-top { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 24px; margin-top: 8px; }
-.top-card { position: relative; background: #181818; border-radius: 8px; padding: 20px; cursor: pointer; transition: background .2s; min-height: 228px; }
+.top-card { display: block; position: relative; background: #181818; border-radius: 8px; padding: 20px; cursor: pointer; transition: background .2s; min-height: 228px; }
 .top-card:hover { background: #282828; }
 .top-card img { width: 96px; height: 96px; object-fit: cover; border-radius: 6px; box-shadow: 0 8px 24px rgba(0, 0, 0, .5); }
 .top-title { font-size: 28px; font-weight: 800; margin: 18px 0 8px; line-height: 1.2; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; padding-right: 56px; }
@@ -231,8 +255,18 @@ body.is-playing .row.is-current .eq i { animation: eq .8s ease-in-out infinite a
   margin: -8px -24px 0; padding: 48px 24px 24px;
   background: linear-gradient(180deg, #5038a0 0%, #2d2166 70%, var(--panel) 100%);
 }
+.playlist-head.tinted { background: linear-gradient(180deg, var(--c) 0%, rgba(18, 18, 18, .55) 75%, var(--panel) 100%); }
 .playlist-art { width: 200px; height: 200px; border-radius: 6px; flex: none; box-shadow: 0 8px 40px rgba(0, 0, 0, .5); }
+img.playlist-art { object-fit: cover; background: #282828; }
 .playlist-art .ic { width: 72px; height: 72px; }
+.album-label { margin-top: 16px; }
+
+.artist-hero {
+  display: flex; align-items: flex-end; min-height: 320px;
+  margin: -8px -24px 0; padding: 120px 24px 24px;
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0) 35%, rgba(0, 0, 0, .7)), var(--img) center 25% / cover, #333;
+}
+.artist-hero .playlist-title { text-shadow: 0 2px 16px rgba(0, 0, 0, .4); }
 .eyebrow { font-size: 13px; font-weight: 600; }
 .playlist-title { font-size: clamp(36px, 6vw, 88px); font-weight: 900; letter-spacing: -2px; line-height: 1.05; margin: 6px 0 12px; }
 .playlist-meta { color: rgba(255, 255, 255, .8); font-size: 14px; }
@@ -241,6 +275,7 @@ body.is-playing .row.is-current .eq i { animation: eq .8s ease-in-out infinite a
 .big-play .ic { width: 24px; height: 24px; }
 .big-play:hover { transform: scale(1.05); background: var(--accent-hover); }
 .action-bar .ctrl .ic { width: 28px; height: 28px; }
+.action-bar + .section { margin-top: 8px; }
 
 .library-page h1 { font-size: 28px; font-weight: 800; margin: 12px 0 16px; }
 .library-page .library-list { padding: 0; }
@@ -277,6 +312,9 @@ body.is-playing .row.is-current .eq i { animation: eq .8s ease-in-out infinite a
 .np-title, .np-artist { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .np-title { font-weight: 600; }
 .np-artist { font-size: 12px; color: var(--sub); }
+@media (hover: hover) {
+  .np-artist[data-action]:hover { color: var(--text); text-decoration: underline; cursor: pointer; }
+}
 body:not(.has-track) .np > * { visibility: hidden; }
 body:not(.has-track) .controls, body:not(.has-track) .extras [data-action="queue"] { opacity: .5; }
 
@@ -442,5 +480,10 @@ body[data-vol="high"] .vol-btn .ic-volHigh { display: block; }
 
   .playlist-head { flex-direction: column; align-items: flex-start; margin: -8px -16px 0; padding: 32px 16px 16px; }
   .playlist-art { width: 160px; height: 160px; align-self: center; }
+  .artist-hero { min-height: 240px; margin: -8px -16px 0; padding: 80px 16px 16px; }
+  /* Tiles scroll sideways on phones. */
+  .cards { display: flex; overflow-x: auto; gap: 12px; margin: 0 -16px; padding: 0 16px; scrollbar-width: none; }
+  .card { flex: 0 0 136px; padding: 0; }
+  .card:hover { background: none; }
   .toast { bottom: 140px; }
 }

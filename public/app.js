@@ -1,4 +1,5 @@
 import { HiddenPlayer, State } from './player.js';
+import * as dz from './deezer.js';
 
 /* ================= helpers ================= */
 
@@ -104,6 +105,9 @@ const ICONS = {
   radio: `<circle cx="12" cy="12" r="2.2"/><path ${S} d="M16.2 7.8a6 6 0 0 1 0 8.4M7.8 16.2a6 6 0 0 1 0-8.4M19.1 4.9a10 10 0 0 1 0 14.2M4.9 19.1a10 10 0 0 1 0-14.2"/>`,
   clock: `<circle ${S} cx="12" cy="12" r="9"/><path ${S} d="M12 7v5l3 2"/>`,
   playNext: `<path ${S} d="M4 12h12M12 6l6 6-6 6"/>`,
+  artist: `<circle ${S} cx="12" cy="8" r="4"/><path ${S} d="M4 21a8 8 0 0 1 16 0"/>`,
+  album: `<circle ${S} cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.4"/>`,
+  chart: `<path ${S} d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>`,
 };
 const icon = Object.fromEntries(
   Object.entries(ICONS).map(([name, body]) => [
@@ -126,7 +130,6 @@ const state = {
   playedTitles: new Set(),
   radioGen: 0,
   radioPromise: null,
-  pending: [], // recommended songs (artist + title) not yet matched to a YouTube video
   station: newStation([]),
   sessionSkips: new Map(), // artist -> autoplay songs of theirs skipped early this visit
   shuffle: store.get('shuffle', false),
@@ -175,19 +178,10 @@ const lists = new Map([
   ['liked', { tracks: state.liked, mode: 'context', name: 'Liked Songs' }],
 ]);
 
-const GENRES = [
-  { name: 'Pop', q: 'pop hits', color: '#e13300' },
-  { name: 'Hip-Hop', q: 'hip hop hits', color: '#bc5900' },
-  { name: 'Rock', q: 'rock classics', color: '#e91429' },
-  { name: 'R&B', q: 'r&b songs', color: '#dc148c' },
-  { name: 'K-Pop', q: 'kpop hits', color: '#8d67ab' },
-  { name: 'Chill', q: 'chill songs', color: '#477d95' },
-  { name: 'Dance / EDM', q: 'edm hits', color: '#608108' },
-  { name: 'Indie', q: 'indie songs', color: '#1e3264' },
-  { name: 'Jazz', q: 'jazz classics', color: '#0d73ec' },
-  { name: 'Latin', q: 'latin hits', color: '#e1118c' },
-  { name: 'Acoustic', q: 'acoustic songs', color: '#27856a' },
-  { name: 'Lo-fi', q: 'lofi songs', color: '#503750' },
+// Tile colors for Deezer's genres, in order.
+const GENRE_COLORS = [
+  '#e13300', '#bc5900', '#e91429', '#dc148c', '#8d67ab', '#477d95', '#608108', '#1e3264',
+  '#0d73ec', '#e1118c', '#27856a', '#503750', '#af2896', '#148a08', '#7358ff', '#ba5d07',
 ];
 
 /* ================= elements ================= */
@@ -212,6 +206,47 @@ const noHover = matchMedia('(hover: none)');
 
 /* ================= playback ================= */
 
+// Songs come from Deezer, which only has 30-second previews, so each one plays from its upload on
+// YouTube. Our server finds that upload (artist, title and length); matches are remembered here.
+const videoIds = new Map(Object.entries(store.get('videos', {})));
+const lookups = new Map(); // track id -> pending lookup
+
+function rememberVideo(track, videoId) {
+  videoIds.delete(track.id);
+  if (videoId) videoIds.set(track.id, videoId);
+  while (videoIds.size > 2000) videoIds.delete(videoIds.keys().next().value);
+  store.set('videos', Object.fromEntries(videoIds));
+}
+
+// A song's YouTube video id, or null if YouTube has nothing that matches. Songs saved before the
+// switch to Deezer are YouTube videos already. `exclude` skips videos that failed to play.
+function resolveVideo(track, { exclude = [] } = {}) {
+  if (!track.dz) return Promise.resolve(track.id);
+  if (!exclude.length) {
+    if (videoIds.has(track.id)) return Promise.resolve(videoIds.get(track.id));
+    if (lookups.has(track.id)) return lookups.get(track.id);
+  }
+  const lookup = api('/api/match', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ songs: [{ artist: track.artist, title: track.title, duration: track.duration, exclude }] }),
+  })
+    .then(({ videos = [] }) => {
+      const videoId = videos[0] || null;
+      if (videoId) rememberVideo(track, videoId);
+      return videoId;
+    })
+    .finally(() => lookups.delete(track.id));
+  if (!exclude.length) lookups.set(track.id, lookup);
+  return lookup;
+}
+
+// Looks up the next song's video while this one plays, so it starts without a pause.
+function prefetchNext() {
+  const upcoming = [state.queue[0], state.context.tracks[0], state.autoplay[0]].find(Boolean);
+  if (upcoming) resolveVideo(upcoming).catch(() => {});
+}
+
 function startTrack(entry, { pushHistory = true } = {}) {
   if (pushHistory && state.current) {
     state.history.push(state.current);
@@ -220,10 +255,42 @@ function startTrack(entry, { pushHistory = true } = {}) {
   state.current = entry;
   state.played.add(entry.track.id);
   state.playedTitles.add(songKey(entry.track));
-  player.load(entry.track.id);
   updateNowPlaying();
   renderQueue();
   ensureRadio();
+  loadCurrent();
+}
+
+// Finds the playing song's video and loads it. Until then the previous song is paused, and if
+// YouTube has no match the song is skipped (but not song after song: three misses in a row stop).
+let loadSeq = 0;
+let missStreak = 0;
+async function loadCurrent({ exclude = [], start = 0, autoplay = true } = {}) {
+  const entry = state.current;
+  const seq = ++loadSeq;
+  if (autoplay && entry.track.dz && (exclude.length || !videoIds.has(entry.track.id))) player.pause();
+  let videoId = null;
+  let failed = false;
+  try {
+    videoId = await resolveVideo(entry.track, { exclude });
+  } catch (err) {
+    failed = true;
+    console.warn('YouTube lookup failed:', err.message);
+  }
+  if (seq !== loadSeq || state.current !== entry) return;
+  if (!videoId) {
+    if (++missStreak >= 3) {
+      missStreak = 0;
+      return toast(failed ? "Can't reach the server to find songs on YouTube." : "Couldn't find these songs on YouTube.", 6000);
+    }
+    toast(failed ? `Couldn't load "${entry.track.title}" — skipping` : `"${entry.track.title}" isn't on YouTube — skipping`);
+    return next('error');
+  }
+  missStreak = 0;
+  entry.videoId = videoId;
+  if (autoplay) player.load(videoId, start);
+  else player.cue(videoId, start);
+  prefetchNext();
 }
 
 // Play a song on its own: autoplay continues with similar songs (Spotify's song radio).
@@ -291,7 +358,9 @@ function rate(reason) {
     state.station.loved.push(track);
     return;
   }
-  if (reason !== 'skip' || player.currentTime >= EARLY_SKIP_SECONDS) return;
+  // A song still being looked up on YouTube hasn't started yet.
+  const elapsed = entry.videoId ? player.currentTime : 0;
+  if (reason !== 'skip' || elapsed >= EARLY_SKIP_SECONDS) return;
   const key = artistOf(track);
   state.sessionSkips.set(key, (state.sessionSkips.get(key) || 0) + 1);
   nudgeTaste(track, -1);
@@ -365,7 +434,6 @@ function addToQueue(track, { playNext = false } = {}) {
 function resetRadio() {
   state.radioGen++;
   state.autoplay.length = 0;
-  state.pending.length = 0;
   state.radioPromise = null;
 }
 
@@ -493,79 +561,7 @@ function appendAutoplay(tracks, gen, { opening = false } = {}) {
   return fresh.length;
 }
 
-// Deezer's public API, called from the browser with JSONP (it sends no CORS headers). It runs here
-// rather than on the server because Deezer, like YouTube, blocks requests from cloud servers.
-let deezerSeq = 0;
-function deezer(path) {
-  return new Promise((resolve, reject) => {
-    const callback = `__deezer${++deezerSeq}`;
-    const script = document.createElement('script');
-    const finish = (err, data) => {
-      clearTimeout(timer);
-      window[callback] = () => {}; // a response arriving after the timeout must not throw
-      script.remove();
-      if (err) reject(err);
-      else if (data?.error) reject(new Error(`Deezer: ${data.error.message || data.error.type}`));
-      else resolve(data);
-    };
-    const timer = setTimeout(() => finish(new Error('Deezer timed out')), 8000);
-    window[callback] = (data) => finish(null, data);
-    script.onerror = () => finish(new Error('Deezer is unreachable'));
-    script.src = `https://api.deezer.com${path}${path.includes('?') ? '&' : '?'}output=jsonp&callback=${callback}`;
-    document.head.append(script);
-  });
-}
-
-async function deezerTrackFor(track) {
-  const artist = stripExtras(track.artist);
-  const title = stripExtras(track.title);
-  const artistKey = normKey(artist);
-  for (const q of new Set([`${artist} ${title}`.trim(), title])) {
-    if (!q) continue;
-    const { data = [] } = await deezer(`/search?limit=10&q=${encodeURIComponent(q)}`);
-    const sameArtist = data.find((d) => {
-      const a = normKey(d.artist?.name);
-      return artistKey && a && (a.includes(artistKey) || artistKey.includes(a));
-    });
-    if (sameArtist || data[0]) return sameArtist || data[0];
-  }
-  return null;
-}
-
-// Deezer's artist radio: songs by the artist and by similar artists — the same idea as Spotify's radio.
-async function loadDeezerRadio(seed, gen) {
-  const found = await deezerTrackFor(seed);
-  if (!found?.artist?.id) throw new Error('song not found on Deezer');
-  const { data = [] } = await deezer(`/artist/${found.artist.id}/radio?limit=40`);
-  if (gen !== state.radioGen) return;
-  const keys = new Set([
-    songKey(seed),
-    songKey({ title: found.title_short || found.title }),
-    ...state.playedTitles,
-    ...state.autoplay.map(songKey),
-    ...state.pending.map(songKey),
-  ]);
-  for (const d of data) {
-    const song = { artist: d.artist?.name || '', title: d.title_short || d.title || '', duration: d.duration || 0 };
-    const key = songKey(song);
-    if (!song.artist || !key || keys.has(key)) continue;
-    keys.add(key);
-    state.pending.push(song);
-  }
-}
-
-// Matches the next few recommended songs to their YouTube uploads (via our server's YouTube search).
-async function matchPending(gen) {
-  const songs = state.pending.splice(0, 6);
-  const { tracks = [] } = await api('/api/match', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ songs }),
-  });
-  return appendAutoplay(tracks.filter(Boolean), gen);
-}
-
-// Each seed song gives a few different mixes (the server varies them) before it's retired.
+// Each seed song gives a few different mixes (each one reaches a little further) before it's retired.
 const MAX_SEED_USES = 3;
 
 // The song the next recommendations are built from. The first mix comes from what's playing. After
@@ -582,51 +578,29 @@ function nextSeed() {
   return order.find(ok) || (cur && (st.seeds[cur.id] || 0) < 9 ? cur : null);
 }
 
-// Keeps "Next up" stocked. Recommendations come from YouTube Music artist pages (through our
-// server). Only if YouTube Music isn't reachable from the server is Deezer's artist radio used,
-// and as a last resort other songs by the same artist.
+// Keeps "Next up" stocked with recommendations from Deezer (see dz.radioMix).
 function ensureRadio() {
   if (!state.current) return Promise.resolve();
   if (state.radioPromise) return state.radioPromise;
   if (state.autoplay.length >= 4 || state.context.tracks.length > 2) return Promise.resolve();
-  const seed = state.pending.length ? null : nextSeed();
-  if (!seed && !state.pending.length) return Promise.resolve();
+  const seed = nextSeed();
+  if (!seed) return Promise.resolve();
 
   const gen = state.radioGen;
   const station = state.station;
   const promise = (async () => {
-    const uses = seed ? station.seeds[seed.id] || 0 : 0;
+    const uses = station.seeds[seed.id] || 0;
     try {
-      if (seed) {
-        station.seeds[seed.id] = uses + 1;
-        const first = station.refills++ === 0;
-        const params = new URLSearchParams({ id: seed.id, artist: seed.artist, title: seed.title, v: uses });
-        let added = 0;
-        try {
-          const { tracks } = await api(`/api/ytmusic/radio?${params}`);
-          // A station's first mix may open with more songs by the artist you chose, right after them.
-          const opening = first && state.current?.track.id === seed.id;
-          added = appendAutoplay(tracks, gen, { opening });
-        } catch (err) {
-          console.warn('YouTube Music recommendations unavailable, trying Deezer:', err.message);
-        }
-        if (!added && gen === state.radioGen) {
-          try {
-            await loadDeezerRadio(seed, gen);
-          } catch (err) {
-            console.warn('Deezer radio unavailable, using songs by the same artist:', err.message);
-            appendAutoplay((await api(`/api/radio?${params}`)).tracks, gen);
-          }
-        }
-      }
-      while (gen === state.radioGen && state.autoplay.length < 4 && state.pending.length) {
-        await matchPending(gen);
-        renderQueue();
-      }
+      station.seeds[seed.id] = uses + 1;
+      const first = station.refills++ === 0;
+      const tracks = await dz.radioMix(seed, { variant: uses });
+      // A station's first mix may open with more songs by the artist you chose, right after them.
+      const opening = first && state.current?.track.id === seed.id;
+      appendAutoplay(tracks, gen, { opening });
     } catch (err) {
       console.warn('Autoplay lookup failed:', err.message);
       // The seed wasn't really used, so it can be tried again.
-      if (seed && gen === state.radioGen) station.seeds[seed.id] = uses;
+      if (gen === state.radioGen) station.seeds[seed.id] = uses;
     } finally {
       if (state.radioPromise === promise) state.radioPromise = null;
       renderQueue();
@@ -637,16 +611,15 @@ function ensureRadio() {
   return promise;
 }
 
-// Used when the user skips and nothing is lined up yet: wait for the related-songs lookup, and
-// only if it fails entirely fall back to other songs by the same artist.
+// Used when the user skips and nothing is lined up yet: wait for the recommendations, and only if
+// they fail entirely fall back to other songs by the same artist.
 async function fillAutoplay() {
   const seed = state.current.track;
   const gen = state.radioGen;
   await ensureRadio();
   if (!state.autoplay.length && gen === state.radioGen) {
     try {
-      const res = await api(`/api/search?q=${encodeURIComponent(seed.artist)}`);
-      appendAutoplay(res.tracks, gen);
+      appendAutoplay((await dz.search(seed.artist)).tracks, gen);
     } catch {}
   }
   renderQueue();
@@ -681,8 +654,20 @@ player.addEventListener('timeupdate', scheduleTick);
 // YouTube's error codes for a video that's gone (100) or not allowed in embeds (101, 150).
 const UNPLAYABLE_ERRORS = [100, 101, 150];
 
+// How many other uploads of a song are tried when its video won't play outside YouTube.
+const MAX_VIDEO_RETRIES = 2;
+
 player.addEventListener('error', (e) => {
-  if (state.current && UNPLAYABLE_ERRORS.includes(e.detail)) markUnplayable(state.current.track.id);
+  const entry = state.current;
+  if (entry && UNPLAYABLE_ERRORS.includes(e.detail)) {
+    const tried = [...(entry.badVideos || []), entry.videoId].filter(Boolean);
+    if (entry.track.dz && tried.length <= MAX_VIDEO_RETRIES) {
+      entry.badVideos = tried;
+      rememberVideo(entry.track, null);
+      return loadCurrent({ exclude: tried });
+    }
+    markUnplayable(entry.track.id);
+  }
   if (++errorStreak > 5) {
     errorStreak = 0;
     toast('Playback keeps failing. The video player may be blocked on this network.', 6000);
@@ -729,10 +714,33 @@ const section = (title, body) => `<section class="section"><h2>${esc(title)}</h2
 const empty = (title, text, extra = '') =>
   `<div class="empty"><h2>${title}</h2><p>${text}</p>${extra}</div>`;
 
-const genreGrid = () =>
-  `<div class="genre-grid">${GENRES.map(
-    (g) => `<a class="genre" style="--c:${g.color}" href="#/search?q=${encodeURIComponent(g.q)}">${esc(g.name)}</a>`
-  ).join('')}</div>`;
+const loading = () => `<div style="margin-top:24px">${'<div class="skeleton"></div>'.repeat(8)}</div>`;
+const failed = (err) =>
+  empty('Something went wrong', esc(err.message), '<button class="pill" data-action="retry">Try again</button>');
+
+// Deezer's genres, loaded once per visit.
+let genreList = null;
+function loadGenres() {
+  genreList ??= dz.genres().catch((err) => {
+    genreList = null;
+    throw err;
+  });
+  return genreList;
+}
+
+const genreColor = (i) => GENRE_COLORS[i % GENRE_COLORS.length];
+
+const genreGrid = (items) =>
+  `<div class="genre-grid">${items
+    .map(
+      (g, i) =>
+        `<a class="genre" style="--c:${genreColor(i)}" href="#/genre/${g.id}">${esc(g.name)}${
+          g.picture ? `<img src="${esc(g.picture)}" alt="" loading="lazy">` : ''
+        }</a>`
+    )
+    .join('')}</div>`;
+
+const artistLink = (t) => (t.artistId ? `<a href="#/artist/${t.artistId}">${esc(t.artist)}</a>` : esc(t.artist));
 
 function rows(tracks, key, offset = 0) {
   return tracks
@@ -746,8 +754,8 @@ function rows(tracks, key, offset = 0) {
       </div>
       <img class="row-art" src="${esc(t.thumbnail.small)}" alt="" loading="lazy">
       <div class="row-main">
-        <div class="row-title" title="${esc(t.rawTitle)}">${esc(t.title)}</div>
-        <div class="row-artist">${esc(t.artist)}</div>
+        <div class="row-title" title="${esc(t.album ? `${t.title} · ${t.album}` : t.rawTitle)}">${esc(t.title)}</div>
+        <div class="row-artist">${artistLink(t)}</div>
       </div>
       <button class="icon-btn like-btn row-like" data-act="like" data-like="${esc(t.id)}" aria-label="Save to Liked Songs">${icon.heart}</button>
       <button class="icon-btn row-add" data-act="queue" aria-label="Add to queue" title="Add to queue">${icon.addQueue}</button>
@@ -760,6 +768,38 @@ function rows(tracks, key, offset = 0) {
 
 const rowsHead = () =>
   `<div class="row row-head"><div class="row-num">#</div><div></div><div>Title</div><div></div><div></div>${icon.clock}<div></div></div>`;
+
+const RECORD_TYPES = { album: 'Album', single: 'Single', ep: 'EP', compile: 'Compilation' };
+const recordType = (type) => RECORD_TYPES[type] || 'Album';
+
+// Album and artist tiles link to their pages, with a button to play them right away.
+const albumCard = (a, { byArtist = true } = {}) => `
+  <a class="card" href="#/album/${a.id}">
+    <div class="card-art">
+      <img src="${esc(a.cover.small)}" alt="" loading="lazy">
+      <button class="card-play" data-action="play-album" data-id="${a.id}" aria-label="Play ${esc(a.title)}">${icon.play}</button>
+    </div>
+    <div class="card-title" title="${esc(a.title)}">${esc(a.title)}</div>
+    <div class="card-sub">${esc(byArtist ? a.artist : [a.year, recordType(a.type)].filter(Boolean).join(' • '))}</div>
+  </a>`;
+
+const artistCard = (a) => `
+  <a class="card artist-card" href="#/artist/${a.id}">
+    <div class="card-art">
+      <img src="${esc(a.picture.small)}" alt="" loading="lazy">
+      <button class="card-play" data-action="play-artist" data-id="${a.id}" aria-label="Play ${esc(a.name)}">${icon.play}</button>
+    </div>
+    <div class="card-title" title="${esc(a.name)}">${esc(a.name)}</div>
+    <div class="card-sub">Artist</div>
+  </a>`;
+
+const cards = (items, card) => `<div class="cards">${items.map((x) => card(x)).join('')}</div>`;
+
+const playBar = (key, label) => `
+  <div class="action-bar">
+    <button class="big-play" data-action="play-list" data-target="${key}" aria-label="Play ${esc(label)}">${icon.play}</button>
+    <button class="ctrl ${state.shuffle ? 'on' : ''}" data-action="shuffle" aria-label="Shuffle">${icon.shuffle}</button>
+  </div>`;
 
 function libraryHTML() {
   const n = state.liked.length;
@@ -776,7 +816,7 @@ function renderLibrary() {
   markCurrent();
 }
 
-function renderHome() {
+async function renderHome(gen) {
   const hour = new Date().getHours();
   const greeting = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
 
@@ -785,14 +825,33 @@ function renderHome() {
       <h1>${greeting}</h1>
       <div class="quick-grid">
         <a class="quick" href="#/liked"><div class="quick-art liked-art">${icon.heart}</div><span>Liked Songs</span></a>
+        <a class="quick" href="#/genre/0"><div class="quick-art charts-art">${icon.chart}</div><span>Top charts</span></a>
       </div>
     </section>
     ${
       state.liked.length
         ? ''
-        : `<section class="welcome"><h2>Start listening</h2><p>Search for any song or artist. When your queue runs out, similar songs keep playing.</p><a class="pill" href="#/search">Search music</a></section>`
+        : `<section class="welcome"><h2>Start listening</h2><p>Search for any song, artist or album. When your queue runs out, similar songs keep playing.</p><a class="pill" href="#/search">Search music</a></section>`
     }
-    ${section('Browse genres', genreGrid())}`;
+    <div id="home-more">${loading()}</div>`;
+
+  try {
+    const [top, genres] = await Promise.all([dz.charts(0), loadGenres()]);
+    if (gen !== viewGen) return;
+    lists.set('chart', { tracks: top.tracks, mode: 'context', name: 'Top charts' });
+    $('#home-more').innerHTML = `
+      <section class="section">
+        <div class="section-head"><h2>Top songs right now</h2><a class="link-btn" href="#/genre/0">Show all</a></div>
+        <div class="tracklist">${rows(top.tracks.slice(0, 5), 'chart')}</div>
+      </section>
+      ${top.artists.length ? section('Popular artists', cards(top.artists, artistCard)) : ''}
+      ${top.albums.length ? section('Popular albums', cards(top.albums, albumCard)) : ''}
+      ${section('Browse genres', genreGrid(genres))}`;
+    markCurrent();
+    updateLikes();
+  } catch (err) {
+    if (gen === viewGen) $('#home-more').innerHTML = failed(err);
+  }
 }
 
 function renderLiked() {
@@ -808,10 +867,7 @@ function renderLiked() {
     </header>
     ${
       n
-        ? `<div class="action-bar">
-            <button class="big-play" data-action="play-list" data-target="liked" aria-label="Play Liked Songs">${icon.play}</button>
-            <button class="ctrl ${state.shuffle ? 'on' : ''}" data-action="shuffle" aria-label="Shuffle">${icon.shuffle}</button>
-          </div>
+        ? `${playBar('liked', 'Liked Songs')}
           <div class="tracklist">${rowsHead()}${rows(state.liked, 'liked')}</div>`
         : empty('Songs you like will appear here', 'Save songs by tapping the heart icon.', '<a class="pill" href="#/search">Find songs</a>')
     }`;
@@ -821,89 +877,194 @@ function renderLibraryPage() {
   view.innerHTML = `<div class="library-page"><h1>Your Library</h1><div class="library-list">${libraryHTML()}</div></div>`;
 }
 
+async function renderArtist(id, gen) {
+  view.innerHTML = loading();
+  try {
+    const { artist, top, albums, related } = await dz.artistPage(id);
+    if (gen !== viewGen) return;
+    lists.set('artist', { tracks: top, mode: 'context', name: artist.name });
+    view.innerHTML = `
+      <header class="artist-hero" style="--img:url('${esc(artist.picture.large)}')">
+        <div>
+          <div class="eyebrow">Artist</div>
+          <h1 class="playlist-title">${esc(artist.name)}</h1>
+          <div class="playlist-meta">${artist.fans.toLocaleString('en')} fans on Deezer</div>
+        </div>
+      </header>
+      ${top.length ? `${playBar('artist', artist.name)}${section('Popular', `<div class="tracklist">${rows(top, 'artist')}</div>`)}` : ''}
+      ${albums.length ? section('Discography', cards(albums, (a) => albumCard(a, { byArtist: false }))) : ''}
+      ${related.length ? section('Fans also like', cards(related, artistCard)) : ''}`;
+    markCurrent();
+    updateLikes();
+  } catch (err) {
+    if (gen === viewGen) view.innerHTML = failed(err);
+  }
+}
+
+async function renderAlbum(id, gen) {
+  view.innerHTML = loading();
+  try {
+    const { album, tracks } = await dz.albumPage(id);
+    if (gen !== viewGen) return;
+    lists.set('album', { tracks, mode: 'context', name: album.title });
+    const minutes = Math.round(album.duration / 60);
+    const meta = [
+      album.artistId ? `<a href="#/artist/${album.artistId}"><b>${esc(album.artist)}</b></a>` : esc(album.artist),
+      esc(album.year),
+      `${tracks.length} song${tracks.length === 1 ? '' : 's'}${minutes ? `, ${minutes} min` : ''}`,
+    ].filter(Boolean);
+    view.innerHTML = `
+      <header class="playlist-head tinted" style="--c:#535353">
+        <img class="playlist-art" src="${esc(album.cover.large)}" alt="">
+        <div>
+          <div class="eyebrow">${recordType(album.type)}</div>
+          <h1 class="playlist-title">${esc(album.title)}</h1>
+          <div class="playlist-meta">${meta.join(' • ')}</div>
+        </div>
+      </header>
+      ${playBar('album', album.title)}
+      <div class="tracklist">${rowsHead()}${rows(tracks, 'album')}</div>
+      ${album.label ? `<p class="hint album-label">${esc(album.label)}</p>` : ''}`;
+    markCurrent();
+    updateLikes();
+  } catch (err) {
+    if (gen === viewGen) view.innerHTML = failed(err);
+  }
+}
+
+// A genre's charts, or the overall charts for genre 0.
+async function renderGenre(id, gen) {
+  view.innerHTML = loading();
+  try {
+    const [g, top, genres] = await Promise.all([dz.genre(id), dz.charts(id), loadGenres().catch(() => [])]);
+    if (gen !== viewGen) return;
+    lists.set('genre', { tracks: top.tracks, mode: 'context', name: g.name });
+    const index = genres.findIndex((x) => String(x.id) === String(id));
+    view.innerHTML = `
+      <header class="playlist-head tinted" style="--c:${index < 0 ? '#1e3264' : genreColor(index)}">
+        ${g.picture ? `<img class="playlist-art" src="${esc(g.picture)}" alt="">` : `<div class="playlist-art charts-art">${icon.chart}</div>`}
+        <div>
+          <div class="eyebrow">${Number(id) ? 'Genre' : 'Chart'}</div>
+          <h1 class="playlist-title">${esc(g.name)}</h1>
+          <div class="playlist-meta">The most played songs on Deezer right now</div>
+        </div>
+      </header>
+      ${top.tracks.length ? `${playBar('genre', g.name)}<div class="tracklist">${rowsHead()}${rows(top.tracks, 'genre')}</div>` : ''}
+      ${top.artists.length ? section('Popular artists', cards(top.artists, artistCard)) : ''}
+      ${top.albums.length ? section('Popular albums', cards(top.albums, albumCard)) : ''}`;
+    markCurrent();
+    updateLikes();
+  } catch (err) {
+    if (gen === viewGen) view.innerHTML = failed(err);
+  }
+}
+
 let scrollObserver = null;
+
+const MIN_ARTIST_FANS = 5000;
+
+// The top result is the artist when the search is their name, and otherwise the best song. An
+// artist named after a hit (a tribute act called "Blinding Lights") only wins if they're well known.
+function topResult(q, artists, topSong) {
+  const key = normKey(q);
+  const [first] = artists;
+  if (!first || key.length < 2) return null;
+  const name = normKey(first.name);
+  if (name !== key && !(key.length >= 4 && name.includes(key))) return null;
+  return !topSong || artistOf(topSong) === artistOf({ artist: first.name }) || first.fans >= 100000 ? first : null;
+}
 
 async function renderSearch(q, gen) {
   if (!q) {
-    view.innerHTML = section('Browse all', genreGrid());
+    view.innerHTML = loading();
+    try {
+      const genres = await loadGenres();
+      if (gen === viewGen) view.innerHTML = section('Browse all', genreGrid(genres));
+    } catch (err) {
+      if (gen === viewGen) view.innerHTML = failed(err);
+    }
     return;
   }
-  view.innerHTML = `<div style="margin-top:24px">${'<div class="skeleton"></div>'.repeat(8)}</div>`;
+  view.innerHTML = loading();
   try {
-    const res = await api(`/api/search?q=${encodeURIComponent(q)}`);
+    const res = await dz.search(q);
     if (gen !== viewGen) return;
-    const tracks = res.tracks || [];
+    const { tracks, artists, albums } = res;
     lists.set('search', { tracks, mode: 'radio', name: q });
-    if (!tracks.length) {
+    if (!tracks.length && !artists.length && !albums.length) {
       view.innerHTML = empty(`No results found for "${esc(q)}"`, 'Check the spelling, or try different keywords.');
       return;
     }
-    const [top] = tracks;
+    const top = tracks[0];
+    const artist = topResult(q, artists, top);
+    const topCard = artist
+      ? `<a class="top-card" href="#/artist/${artist.id}">
+          <img class="round" src="${esc(artist.picture.small)}" alt="">
+          <div class="top-title">${esc(artist.name)}</div>
+          <div class="top-sub"><span class="chip">Artist</span></div>
+          <button class="card-play" data-action="play-artist" data-id="${artist.id}" aria-label="Play ${esc(artist.name)}">${icon.play}</button>
+        </a>`
+      : top
+        ? `<div class="top-card" data-list="search" data-id="${esc(top.id)}">
+            <img src="${esc(top.thumbnail.small)}" alt="">
+            <div class="top-title" title="${esc(top.title)}">${esc(top.title)}</div>
+            <div class="top-sub"><span class="chip">Song</span><span class="row-artist">${artistLink(top)}</span></div>
+            <button class="card-play pp" data-act="play" aria-label="Play ${esc(top.title)}">${icon.play}${icon.pause}</button>
+          </div>`
+        : '';
+    // Deezer's artist search also returns karaoke and tribute accounts, with few fans and no photo.
+    const otherArtists = artists.filter((a) => a !== artist && a.fans >= MIN_ARTIST_FANS && a.hasPicture).slice(0, 6);
     view.innerHTML = `
       <div class="search-top">
-        <section>
-          <h2>Top result</h2>
-          <div class="top-card" data-list="search" data-id="${esc(top.id)}">
-            <img src="${esc(top.thumbnail.small)}" alt="">
-            <div class="top-title" title="${esc(top.rawTitle)}">${esc(top.title)}</div>
-            <div class="top-sub"><span class="chip">Song</span><span class="row-artist">${esc(top.artist)}</span></div>
-            <button class="card-play pp" data-act="play" aria-label="Play ${esc(top.title)}">${icon.play}${icon.pause}</button>
-          </div>
-        </section>
-        <section>
-          <h2>Songs</h2>
-          <div class="tracklist">${rows(tracks.slice(0, 4), 'search')}</div>
-        </section>
+        ${topCard ? `<section><h2>Top result</h2>${topCard}</section>` : ''}
+        ${tracks.length ? `<section><h2>Songs</h2><div class="tracklist">${rows(tracks.slice(0, 4), 'search')}</div></section>` : ''}
       </div>
+      ${otherArtists.length ? section('Artists', cards(otherArtists, artistCard)) : ''}
+      ${albums.length ? section('Albums', cards(albums, albumCard)) : ''}
       <section class="section" id="more-section" ${tracks.length > 4 ? '' : 'hidden'}>
-        <h2>More results</h2>
+        <h2>More songs</h2>
         <div class="tracklist" id="more-results">${rows(tracks.slice(4), 'search', 4)}</div>
       </section>
       <div class="sentinel" id="sentinel"></div>`;
     markCurrent();
     updateLikes();
-    setupInfiniteScroll(q, res.continuation, gen);
+    setupInfiniteScroll(q, res.next, gen);
   } catch (err) {
-    if (gen !== viewGen) return;
-    view.innerHTML = empty(
-      'Something went wrong',
-      esc(err.message),
-      '<button class="pill" data-action="retry">Try again</button>'
-    );
+    if (gen === viewGen) view.innerHTML = failed(err);
   }
 }
 
-function setupInfiniteScroll(q, continuation, gen) {
+function setupInfiniteScroll(q, nextIndex, gen) {
   scrollObserver?.disconnect();
-  if (!continuation) return;
+  if (nextIndex == null) return;
   const sentinel = $('#sentinel');
-  let token = continuation;
-  let loading = false;
+  let index = nextIndex;
+  let busy = false;
 
   scrollObserver = new IntersectionObserver(
     async ([entry]) => {
-      if (!entry.isIntersecting || loading || !token || gen !== viewGen) return;
-      loading = true;
+      if (!entry.isIntersecting || busy || index == null || gen !== viewGen) return;
+      busy = true;
       sentinel.classList.add('loading');
       try {
-        const res = await api(`/api/search?q=${encodeURIComponent(q)}&continuation=${encodeURIComponent(token)}`);
+        const res = await dz.searchMore(q, index);
         if (gen !== viewGen) return;
         const list = lists.get('search');
         const known = new Set(list.tracks.map((t) => t.id));
-        const fresh = (res.tracks || []).filter((t) => !known.has(t.id));
+        const fresh = res.tracks.filter((t) => !known.has(t.id));
         const offset = list.tracks.length;
         list.tracks.push(...fresh);
         $('#more-section').hidden = false;
         $('#more-results').insertAdjacentHTML('beforeend', rows(fresh, 'search', offset));
         markCurrent();
         updateLikes();
-        token = fresh.length ? res.continuation : null;
+        index = fresh.length ? res.next : null;
       } catch {
-        token = null;
+        index = null;
       } finally {
-        loading = false;
+        busy = false;
         sentinel.classList.remove('loading');
-        if (!token) scrollObserver?.disconnect();
+        if (index == null) scrollObserver?.disconnect();
         else if (gen === viewGen) {
           // Re-observe so a sentinel that's still on screen triggers the next page.
           scrollObserver.unobserve(sentinel);
@@ -1214,6 +1375,8 @@ function openMenu(ref, x, y) {
     <button data-menu="next" role="menuitem">${icon.playNext}Play next</button>
     <button data-menu="queue" role="menuitem">${icon.addQueue}Add to queue</button>
     <button data-menu="radio" role="menuitem">${icon.radio}Go to song radio</button>
+    ${ref.track.artistId ? `<button data-menu="artist" role="menuitem">${icon.artist}Go to artist</button>` : ''}
+    ${ref.track.albumId ? `<button data-menu="album" role="menuitem">${icon.album}Go to album</button>` : ''}
     <button data-menu="like" role="menuitem">${icon.heart}${liked ? 'Remove from Liked Songs' : 'Save to Liked Songs'}</button>`;
   menu.hidden = false;
   const { width, height } = menu.getBoundingClientRect();
@@ -1240,6 +1403,12 @@ function menuAction(action) {
     case 'radio':
       playFresh(ref.track);
       return toast(`Song radio: ${ref.track.title}`);
+    case 'artist':
+      location.hash = `#/artist/${ref.track.artistId}`;
+      return;
+    case 'album':
+      location.hash = `#/album/${ref.track.albumId}`;
+      return;
     case 'like':
       return toggleLike(ref.track);
   }
@@ -1311,12 +1480,42 @@ function handleAction(name, el) {
       return history.forward();
     case 'retry':
       return route();
-    case 'play-list': {
-      const list = lists.get(el.dataset.target);
-      if (!list?.tracks.length) return;
-      const index = state.shuffle ? Math.floor(Math.random() * list.tracks.length) : 0;
-      return playFromList(list, index);
+    case 'play-list':
+      return playWhole(lists.get(el.dataset.target));
+    case 'play-album':
+      return playFetched(async () => {
+        const { album, tracks } = await dz.albumPage(el.dataset.id);
+        return { tracks, name: album.title };
+      });
+    case 'play-artist':
+      return playFetched(async () => {
+        const { artist, top } = await dz.artistPage(el.dataset.id);
+        return { tracks: top, name: artist.name };
+      });
+    case 'go-artist': {
+      // On phones the mini player opens the full player instead.
+      if (isMobile() && $('#fullplayer').hidden) return handleAction('open-full');
+      const id = state.current?.track.artistId;
+      if (!id) return;
+      $('#fullplayer').hidden = true;
+      location.hash = `#/artist/${id}`;
+      return;
     }
+  }
+}
+
+// Plays a whole list from the top (or from a random song with shuffle on).
+function playWhole(list) {
+  if (!list?.tracks.length) return;
+  playFromList(list, state.shuffle ? Math.floor(Math.random() * list.tracks.length) : 0);
+}
+
+// Plays an album or artist straight from its tile, without opening its page.
+async function playFetched(load) {
+  try {
+    playWhole(await load());
+  } catch (err) {
+    toast(`Couldn't load it: ${err.message}`);
   }
 }
 
@@ -1332,7 +1531,14 @@ document.addEventListener('click', (e) => {
   }
 
   const actionEl = e.target.closest('[data-action]');
-  if (actionEl) return handleAction(actionEl.dataset.action, actionEl);
+  if (actionEl) {
+    // A play button on an album or artist tile mustn't also open the page the tile links to.
+    if (actionEl.closest('a[href]')) e.preventDefault();
+    return handleAction(actionEl.dataset.action, actionEl);
+  }
+
+  // Links (an artist's name in a row, say) only navigate.
+  if (e.target.closest('a[href]')) return;
 
   const ref = trackRef(e.target);
   const actEl = e.target.closest('[data-act]');
@@ -1364,7 +1570,7 @@ document.addEventListener('click', (e) => {
 });
 
 document.addEventListener('dblclick', (e) => {
-  if (e.target.closest('button')) return;
+  if (e.target.closest('button, a')) return;
   const ref = e.target.closest('.row') && trackRef(e.target);
   if (ref) playRef(ref);
 });
@@ -1430,14 +1636,33 @@ function hideSuggestions() {
   suggestReq++;
 }
 
-function showSuggestions(items) {
-  suggestItems = items;
+// As you type, the box lists a couple of matching artists and a few songs, like Spotify's. Picking
+// an artist opens their page and picking a song plays it; Enter searches for what's typed.
+function showSuggestions({ artists, tracks }) {
+  suggestItems = [
+    ...artists.map((artist) => ({ artist })),
+    ...tracks.map((track) => ({ track })),
+  ];
   suggestIndex = -1;
-  if (!items.length) return hideSuggestions();
-  suggestionsEl.innerHTML = items
-    .map((s, i) => `<li role="option" data-sug="${i}">${icon.search}<span>${esc(s)}</span></li>`)
+  if (!suggestItems.length) return hideSuggestions();
+  suggestionsEl.innerHTML = suggestItems
+    .map(({ artist, track }, i) =>
+      artist
+        ? `<li role="option" data-sug="${i}"><img class="sug-art round" src="${esc(artist.picture.small)}" alt=""><div class="sug-text"><div class="sug-title">${esc(artist.name)}</div><div class="sug-sub">Artist</div></div></li>`
+        : `<li role="option" data-sug="${i}"><img class="sug-art" src="${esc(track.thumbnail.small)}" alt=""><div class="sug-text"><div class="sug-title">${esc(track.title)}</div><div class="sug-sub">Song • ${esc(track.artist)}</div></div></li>`
+    )
     .join('');
   suggestionsEl.hidden = false;
+}
+
+function pickSuggestion(i) {
+  const item = suggestItems[i];
+  if (!item) return;
+  clearTimeout(suggestTimer);
+  hideSuggestions();
+  if (isMobile()) searchInput.blur();
+  if (item.artist) location.hash = `#/artist/${item.artist.id}`;
+  else playFresh(item.track);
 }
 
 function submitSearch(q) {
@@ -1460,10 +1685,10 @@ searchInput.addEventListener('input', () => {
   suggestTimer = setTimeout(async () => {
     const req = ++suggestReq;
     try {
-      const { suggestions } = await api(`/api/suggest?q=${encodeURIComponent(q)}`);
-      if (req === suggestReq && document.activeElement === searchInput) showSuggestions(suggestions || []);
+      const results = await dz.instant(q);
+      if (req === suggestReq && document.activeElement === searchInput) showSuggestions(results);
     } catch {}
-  }, 180);
+  }, 250);
 });
 
 searchInput.addEventListener('keydown', (e) => {
@@ -1473,7 +1698,9 @@ searchInput.addEventListener('keydown', (e) => {
     const n = suggestItems.length;
     suggestIndex = e.key === 'ArrowDown' ? (suggestIndex + 1) % n : (suggestIndex - 1 + n) % n;
     $$('li', suggestionsEl).forEach((li, i) => li.classList.toggle('active', i === suggestIndex));
-    searchInput.value = suggestItems[suggestIndex];
+  } else if (e.key === 'Enter' && suggestIndex >= 0) {
+    e.preventDefault();
+    pickSuggestion(suggestIndex);
   }
 });
 
@@ -1483,7 +1710,7 @@ suggestionsEl.addEventListener('mousedown', (e) => {
   const li = e.target.closest('[data-sug]');
   if (!li) return;
   e.preventDefault();
-  submitSearch(suggestItems[Number(li.dataset.sug)]);
+  pickSuggestion(Number(li.dataset.sug));
 });
 
 $('#search-form').addEventListener('submit', (e) => {
@@ -1505,7 +1732,9 @@ let viewGen = 0;
 function route() {
   const hash = location.hash.replace(/^#/, '') || '/';
   const [path, qs = ''] = hash.split('?');
-  const name = { '/search': 'search', '/liked': 'liked', '/library': 'library' }[path] || 'home';
+  // Deezer pages: #/artist/ID, #/album/ID and #/genre/ID (genre 0 is the overall charts).
+  const page = path.match(/^\/(artist|album|genre)\/(\d+)$/);
+  const name = page?.[1] || { '/search': 'search', '/liked': 'liked', '/library': 'library' }[path] || 'home';
   const gen = ++viewGen;
 
   document.body.dataset.route = name;
@@ -1526,7 +1755,10 @@ function route() {
     $('#search-clear').hidden = true;
     if (name === 'liked') renderLiked();
     else if (name === 'library') renderLibraryPage();
-    else renderHome();
+    else if (name === 'artist') renderArtist(page[2], gen);
+    else if (name === 'album') renderAlbum(page[2], gen);
+    else if (name === 'genre') renderGenre(page[2], gen);
+    else renderHome(gen);
   }
   markCurrent();
   updateLikes();
@@ -1549,7 +1781,8 @@ function saveSession() {
   const st = state.station;
   store.set('session', {
     current: { track: state.current.track, source: state.current.source },
-    position: player.currentTime,
+    // A song still being looked up on YouTube hasn't started yet.
+    position: state.current.videoId ? player.currentTime : 0,
     queue: state.queue,
     context: { name: state.context.name, tracks: state.context.tracks.slice(0, 500) },
     autoplay: state.autoplay.slice(0, 100),
@@ -1572,7 +1805,7 @@ function restoreSession() {
   for (const id of saved.played || []) state.played.add(id);
   for (const key of saved.playedTitles || []) state.playedTitles.add(key);
   runSeq = Math.max(runSeq, ...state.autoplay.map((t) => t.run || 0));
-  player.cue(state.current.track.id, saved.position || 0);
+  loadCurrent({ start: saved.position || 0, autoplay: false });
 }
 
 window.addEventListener('pagehide', saveSession);
