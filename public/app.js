@@ -36,6 +36,8 @@ const stripExtras = (s) =>
     .trim();
 // "Song (Acoustic) ft. X" and "Song" share a key, so another version of a song counts as a repeat.
 const songKey = (t) => normKey(stripExtras(t.title));
+// Main artist of a credit like "The Weeknd, JENNIE & Lily Rose Depp" or "Calvin Harris feat. Rihanna".
+const artistOf = (t) => normKey(String(t?.artist || '').split(/,|&| x | feat\.? | ft\.? | with /i)[0]);
 
 function isRepeat(track, keys) {
   const key = songKey(track);
@@ -123,15 +125,45 @@ const state = {
   played: new Set(),
   playedTitles: new Set(),
   radioGen: 0,
-  radioSeeds: new Set(),
   radioPromise: null,
   pending: [], // recommended songs (artist + title) not yet matched to a YouTube video
+  station: newStation([]),
+  sessionSkips: new Map(), // artist -> autoplay songs of theirs skipped early this visit
   shuffle: store.get('shuffle', false),
   repeat: store.get('repeat', 'off'), // 'off' | 'one'
   volume: store.get('volume', 80),
   muted: store.get('muted', false),
   liked: store.get('liked', []),
 };
+const likedIds = new Set(state.liked.map((t) => t.id));
+
+// What autoplay is built around, like a Spotify radio station: `anchors` are the songs it started
+// from (one song, or the list playback started from), `loved` the songs finished or saved since.
+function newStation(anchors) {
+  return { anchors, loved: [], refills: 0, seeds: {} };
+}
+
+// How much you like each artist, learned from autoplay and kept between visits: skipping one of
+// their recommended songs early counts against them, finishing one or saving a song counts for them.
+const taste = store.get('taste', {});
+function nudgeTaste(track, delta) {
+  const key = artistOf(track);
+  if (!key) return;
+  const score = Math.max(-5, Math.min(5, (taste[key] || 0) + delta));
+  delete taste[key]; // re-added last, so the oldest opinions are the ones dropped
+  if (score) taste[key] = score;
+  const keys = Object.keys(taste);
+  if (keys.length > 500) delete taste[keys[0]];
+  store.set('taste', taste);
+}
+const dislikes = (t) => (taste[artistOf(t)] || 0) <= -3 || (state.sessionSkips.get(artistOf(t)) || 0) >= 2;
+
+// Videos whose owners don't allow playing them outside YouTube, so autoplay never picks them again.
+const unplayable = new Set(store.get('unplayable', []));
+function markUnplayable(id) {
+  unplayable.add(id);
+  store.set('unplayable', [...unplayable].slice(-300));
+}
 
 // Recently played was removed; delete the history that older versions saved in the browser.
 try {
@@ -198,14 +230,16 @@ function startTrack(entry, { pushHistory = true } = {}) {
 function playFresh(track) {
   state.context = { name: '', tracks: [] };
   resetRadio();
+  state.station = newStation([{ ...track }]);
   startTrack({ track: { ...track }, source: 'direct' });
 }
 
-// Play a song from a list: the rest of that list follows, then autoplay.
+// Play a song from a list: the rest of that list follows, then autoplay with songs like the list's.
 function playFromList(list, index) {
   const rest = list.tracks.slice(index + 1).map((t) => ({ ...t }));
   state.context = { name: list.name, tracks: state.shuffle ? shuffleInPlace(rest) : rest };
   resetRadio();
+  state.station = newStation(shuffleInPlace(list.tracks.map((t) => ({ ...t }))).slice(0, 50));
   startTrack({ track: { ...list.tracks[index] }, source: 'direct' });
 }
 
@@ -225,14 +259,51 @@ function togglePlay() {
 }
 
 function takeNext() {
-  if (state.queue.length) return { track: state.queue.shift(), source: 'queue' };
-  if (state.context.tracks.length) return { track: state.context.tracks.shift(), source: 'context' };
-  if (state.autoplay.length) return { track: state.autoplay.shift(), source: 'autoplay' };
+  for (const [list, source] of [
+    [state.queue, 'queue'],
+    [state.context.tracks, 'context'],
+    [state.autoplay, 'autoplay'],
+  ]) {
+    while (list.length) {
+      const track = list.shift();
+      if (!unplayable.has(track.id)) return { track, source };
+    }
+  }
   return null;
 }
 
+/* ---------- listening feedback ---------- */
+
+const EARLY_SKIP_SECONDS = 30;
+
+// How the playing song ended: 'skip' (Next, or picking another song in the queue), 'end' (played
+// to the end) or 'error'. Like Spotify, only autoplay's own picks teach it anything: an early skip
+// leaves just one more song by that artist, at the back of Next up (and one per mix after that),
+// and a second one takes them out of the mix for this visit. A song played to the end can become
+// the seed of the next recommendations.
+function rate(reason) {
+  const entry = state.current;
+  if (!entry || entry.rated || entry.source !== 'autoplay') return;
+  entry.rated = true;
+  const { track } = entry;
+  if (reason === 'end') {
+    nudgeTaste(track, 0.5);
+    state.station.loved.push(track);
+    return;
+  }
+  if (reason !== 'skip' || player.currentTime >= EARLY_SKIP_SECONDS) return;
+  const key = artistOf(track);
+  state.sessionSkips.set(key, (state.sessionSkips.get(key) || 0) + 1);
+  nudgeTaste(track, -1);
+  state.station.loved = state.station.loved.filter((t) => artistOf(t) !== key);
+  const others = state.autoplay.filter((t) => artistOf(t) !== key);
+  const last = dislikes(track) ? [] : state.autoplay.filter((t) => artistOf(t) === key).slice(0, 1);
+  state.autoplay = [...spaceRuns(queuedRuns(others), recentArtists()), ...last];
+}
+
 let advancing = false;
-async function next() {
+async function next(reason = 'skip') {
+  rate(reason);
   const entry = takeNext();
   if (entry) return startTrack(entry);
   if (!state.current) return;
@@ -271,11 +342,13 @@ function seekBy(delta) {
   if (!state.current) return;
   const dur = player.duration || state.current.track.duration;
   player.seek(Math.min(Math.max(0, player.currentTime + delta), Math.max(0, dur - 0.5)));
+  updatePositionState();
 }
 
 function jumpTo(section, index) {
   const list = section === 'queue' ? state.queue : section === 'context' ? state.context.tracks : state.autoplay;
   const skipped = list.splice(0, index + 1);
+  rate('skip');
   startTrack({ track: skipped.pop(), source: section });
 }
 
@@ -293,11 +366,96 @@ function resetRadio() {
   state.radioGen++;
   state.autoplay.length = 0;
   state.pending.length = 0;
-  state.radioSeeds.clear();
   state.radioPromise = null;
 }
 
-function appendAutoplay(tracks, gen) {
+// Songs in a row by the same artist play as one "run", as radio stations do: autoplay can stay
+// with an artist for up to three songs on purpose, but never runs into them again by accident.
+const MAX_RUN = 3;
+// An artist doesn't come back within this many songs of their last one.
+const ARTIST_GAP = 3;
+let runSeq = 0;
+
+function newRuns(tracks) {
+  const runs = [];
+  for (const t of tracks) {
+    const artist = artistOf(t);
+    const last = runs.at(-1);
+    if (last && last.artist === artist && last.tracks.length < MAX_RUN) last.tracks.push(t);
+    else runs.push({ artist, tracks: [t] });
+  }
+  for (const run of runs) {
+    const id = ++runSeq;
+    for (const t of run.tracks) t.run = id;
+  }
+  return runs;
+}
+
+// The runs already lined up in Next up, from the run ids given to their songs when they were added.
+function queuedRuns(tracks) {
+  const runs = [];
+  for (const t of tracks) {
+    const last = runs.at(-1);
+    if (last && t.run && last.tracks[0].run === t.run) last.tracks.push(t);
+    else runs.push({ artist: artistOf(t), tracks: [t] });
+  }
+  return runs;
+}
+
+// Artists of the songs just played, oldest first.
+const recentArtists = () =>
+  [...state.history.slice(-ARTIST_GAP).map((e) => e.track), state.current?.track].filter(Boolean).map(artistOf);
+
+// Orders runs so no artist returns within ARTIST_GAP songs, keeping the given order wherever it can.
+// `keepFirst` lets the first run follow its own artist: a station opening with more songs by the
+// artist of the song you chose.
+function spaceRuns(runs, recent, { keepFirst = false } = {}) {
+  const played = [...recent];
+  const pool = [...runs];
+  const out = [];
+  while (pool.length) {
+    const window = played.slice(-ARTIST_GAP);
+    let i = keepFirst && !out.length ? 0 : pool.findIndex((r) => !window.includes(r.artist));
+    if (i < 0) i = pool.findIndex((r) => r.artist !== played.at(-1));
+    if (i < 0) {
+      // Only the artist that just played is left: slot their run in earlier, between two other
+      // artists, rather than right after themselves (unless every song left is theirs).
+      const [run] = pool.splice(0, 1);
+      let k = out.length - 1;
+      while (k > 0 && (out[k - 1].artist === run.artist || out[k].artist === run.artist)) k--;
+      if (k > 0) out.splice(k, 0, run);
+      else out.push(run);
+      continue;
+    }
+    const [run] = pool.splice(i, 1);
+    out.push(run);
+    played.push(...run.tracks.map(() => run.artist));
+  }
+  return out.flatMap((r) => r.tracks);
+}
+
+// Like Spotify's radio, now and then plays a song you saved, when its artist is part of the mix:
+// about one in eight songs, on average, however small the batch.
+function familiarPicks(batch, taken, keys) {
+  const count = Math.floor(batch.length / 8) + (Math.random() < (batch.length % 8) / 8 ? 1 : 0);
+  if (!count) return [];
+  const artists = new Set(batch.map(artistOf));
+  const picks = state.liked.filter(
+    (t) =>
+      artists.has(artistOf(t)) &&
+      !taken.has(t.id) &&
+      !state.played.has(t.id) &&
+      !unplayable.has(t.id) &&
+      !state.sessionSkips.has(artistOf(t)) &&
+      !dislikes(t) &&
+      !isRepeat(t, keys)
+  );
+  return shuffleInPlace(picks)
+    .slice(0, count)
+    .map((t) => ({ ...t }));
+}
+
+function appendAutoplay(tracks, gen, { opening = false } = {}) {
   if (gen !== state.radioGen || !tracks?.length) return 0;
   const taken = new Set([
     state.current?.track.id,
@@ -307,16 +465,31 @@ function appendAutoplay(tracks, gen) {
   ]);
   const keys = new Set([...state.playedTitles, ...state.autoplay.map(songKey)]);
   const allowVariants = VARIANT.test(state.current?.track.rawTitle || '');
+  // Artists skipped early once this visit get one song per mix.
+  const skippedOnce = new Set();
   const fresh = [];
   for (const t of tracks) {
     // Songs from YouTube Music artist pages may come without a duration, so only long ones are skipped.
-    if (t.duration > MAX_SONG_SECONDS) continue;
-    if (state.played.has(t.id) || taken.has(t.id)) continue;
+    if (!t || t.duration > MAX_SONG_SECONDS) continue;
+    if (state.played.has(t.id) || taken.has(t.id) || unplayable.has(t.id) || dislikes(t)) continue;
     if ((!allowVariants && VARIANT.test(t.rawTitle)) || isRepeat(t, keys)) continue;
+    if (state.sessionSkips.has(artistOf(t))) {
+      if (skippedOnce.has(artistOf(t))) continue;
+      skippedOnce.add(artistOf(t));
+    }
     keys.add(songKey(t));
-    fresh.push(t);
+    taken.add(t.id);
+    fresh.push({ ...t });
   }
-  state.autoplay.push(...(state.shuffle ? shuffleInPlace(fresh) : fresh));
+  if (!fresh.length) return 0;
+
+  // Shuffle never applies to autoplay: its order is what makes it sound like a radio station.
+  const runs = newRuns(fresh);
+  for (const t of familiarPicks(fresh, taken, keys)) {
+    runs.splice(2 + Math.floor(Math.random() * Math.max(1, runs.length - 1)), 0, ...newRuns([t]));
+  }
+  const recent = [...recentArtists(), ...state.autoplay.map(artistOf)];
+  state.autoplay.push(...spaceRuns(runs, recent, { keepFirst: opening && !state.autoplay.length }));
   return fresh.length;
 }
 
@@ -379,7 +552,6 @@ async function loadDeezerRadio(seed, gen) {
     keys.add(key);
     state.pending.push(song);
   }
-  if (state.shuffle) shuffleInPlace(state.pending);
 }
 
 // Matches the next few recommended songs to their YouTube uploads (via our server's YouTube search).
@@ -393,26 +565,48 @@ async function matchPending(gen) {
   return appendAutoplay(tracks.filter(Boolean), gen);
 }
 
+// Each seed song gives a few different mixes (the server varies them) before it's retired.
+const MAX_SEED_USES = 3;
+
+// The song the next recommendations are built from. The first mix comes from what's playing. After
+// that, like Spotify's radio, it alternates between the station's anchors, so the music stays close
+// to where it started, and the songs you finished or saved since, so it follows what you enjoy.
+function nextSeed() {
+  const st = state.station;
+  const cur = state.current?.track;
+  const ok = (t) => t && (st.seeds[t.id] || 0) < MAX_SEED_USES && !dislikes(t);
+  const anchors = st.anchors.filter(ok);
+  const anchor = anchors[Math.floor(Math.random() * anchors.length)];
+  const loved = st.loved.filter(ok).at(-1);
+  const order = st.refills === 0 ? [cur, anchor, loved] : st.refills % 2 ? [loved, anchor, cur] : [anchor, loved, cur];
+  return order.find(ok) || (cur && (st.seeds[cur.id] || 0) < 9 ? cur : null);
+}
+
 // Keeps "Next up" stocked. Recommendations come from YouTube Music artist pages (through our
 // server). Only if YouTube Music isn't reachable from the server is Deezer's artist radio used,
-// and as a last resort other songs by the same artist. When recommendations run out, a new radio
-// starts from whatever is playing then, so the music drifts naturally like Spotify's.
+// and as a last resort other songs by the same artist.
 function ensureRadio() {
-  const seed = state.current?.track;
-  if (!seed) return Promise.resolve();
+  if (!state.current) return Promise.resolve();
   if (state.radioPromise) return state.radioPromise;
   if (state.autoplay.length >= 4 || state.context.tracks.length > 2) return Promise.resolve();
-  if (!state.pending.length && state.radioSeeds.has(seed.id)) return Promise.resolve();
+  const seed = state.pending.length ? null : nextSeed();
+  if (!seed && !state.pending.length) return Promise.resolve();
 
   const gen = state.radioGen;
+  const station = state.station;
   const promise = (async () => {
+    const uses = seed ? station.seeds[seed.id] || 0 : 0;
     try {
-      if (!state.pending.length) {
-        state.radioSeeds.add(seed.id);
-        const params = new URLSearchParams({ id: seed.id, artist: seed.artist, title: seed.title });
+      if (seed) {
+        station.seeds[seed.id] = uses + 1;
+        const first = station.refills++ === 0;
+        const params = new URLSearchParams({ id: seed.id, artist: seed.artist, title: seed.title, v: uses });
         let added = 0;
         try {
-          added = appendAutoplay((await api(`/api/ytmusic/radio?${params}`)).tracks, gen);
+          const { tracks } = await api(`/api/ytmusic/radio?${params}`);
+          // A station's first mix may open with more songs by the artist you chose, right after them.
+          const opening = first && state.current?.track.id === seed.id;
+          added = appendAutoplay(tracks, gen, { opening });
         } catch (err) {
           console.warn('YouTube Music recommendations unavailable, trying Deezer:', err.message);
         }
@@ -431,7 +625,8 @@ function ensureRadio() {
       }
     } catch (err) {
       console.warn('Autoplay lookup failed:', err.message);
-      if (gen === state.radioGen) state.radioSeeds.delete(seed.id);
+      // The seed wasn't really used, so it can be tried again.
+      if (seed && gen === state.radioGen) station.seeds[seed.id] = uses;
     } finally {
       if (state.radioPromise === promise) state.radioPromise = null;
       renderQueue();
@@ -468,24 +663,33 @@ player.addEventListener('statechange', () => {
   if ('mediaSession' in navigator && (s === State.PLAYING || s === State.PAUSED)) {
     navigator.mediaSession.playbackState = s === State.PLAYING ? 'playing' : 'paused';
   }
+  updatePositionState();
+  scheduleTick();
+  if (s === State.PAUSED) saveSession();
   if (s === State.ENDED) {
     if (state.repeat === 'one') {
       player.seek(0);
       player.play();
     } else {
-      next();
+      next('end');
     }
   }
 });
 
-player.addEventListener('error', () => {
+player.addEventListener('timeupdate', scheduleTick);
+
+// YouTube's error codes for a video that's gone (100) or not allowed in embeds (101, 150).
+const UNPLAYABLE_ERRORS = [100, 101, 150];
+
+player.addEventListener('error', (e) => {
+  if (state.current && UNPLAYABLE_ERRORS.includes(e.detail)) markUnplayable(state.current.track.id);
   if (++errorStreak > 5) {
     errorStreak = 0;
     toast('Playback keeps failing. The video player may be blocked on this network.', 6000);
     return;
   }
   toast(`"${state.current?.track.title ?? 'This song'}" can't be played here — skipping`);
-  next();
+  next('error');
 });
 
 player.addEventListener('blocked', () => {
@@ -494,15 +698,23 @@ player.addEventListener('blocked', () => {
 
 /* ================= library: liked songs ================= */
 
-const isLiked = (id) => state.liked.some((t) => t.id === id);
+const isLiked = (id) => likedIds.has(id);
 
+// Saving a song also tells autoplay you like its artist, and can make it a seed for what plays next.
 function toggleLike(track) {
   const i = state.liked.findIndex((t) => t.id === track.id);
   if (i >= 0) {
     state.liked.splice(i, 1);
+    likedIds.delete(track.id);
+    nudgeTaste(track, -2);
+    state.station.loved = state.station.loved.filter((t) => t.id !== track.id);
     toast('Removed from Liked Songs');
   } else {
-    state.liked.unshift({ ...track });
+    const { run, ...saved } = track; // `run` is autoplay's bookkeeping, not part of the song
+    state.liked.unshift(saved);
+    likedIds.add(track.id);
+    nudgeTaste(track, 2);
+    state.station.loved.push({ ...track });
     toast('Added to Liked Songs');
   }
   store.set('liked', state.liked);
@@ -705,6 +917,8 @@ function setupInfiniteScroll(q, continuation, gen) {
 }
 
 function renderQueue() {
+  // Every change to what's playing or lined up comes through here, so it's saved from here too.
+  persistSession();
   if (!document.body.classList.contains('queue-open')) return;
   const item = (t, sectionName, i) => `
     <div class="q-item ${sectionName === 'current' ? 'is-now' : ''}" ${sectionName === 'current' ? '' : `data-q="${sectionName}" data-i="${i}"`} title="${esc(t.rawTitle)}">
@@ -728,7 +942,7 @@ function renderQueue() {
     html += state.context.tracks.slice(0, 50).map((t, i) => item(t, 'context', i)).join('');
   }
   if (cur) {
-    html += `<h3>Next up · Autoplay</h3><p class="hint">Songs by this artist and similar artists.</p>`;
+    html += `<h3>Next up · Autoplay</h3><p class="hint">Similar artists, mixed like a radio station. Skip a song early and you'll hear less of that artist.</p>`;
     html += state.autoplay.length
       ? state.autoplay.slice(0, 50).map((t, i) => item(t, 'autoplay', i)).join('')
       : `<p class="hint">${state.radioPromise ? 'Finding similar songs…' : 'Recommendations will appear here.'}</p>`;
@@ -752,12 +966,16 @@ function updateNowPlaying() {
   $$('[data-np="art"]').forEach((el) => {
     if (t) el.src = el.dataset.size === 'hq' ? t.thumbnail.large : t.thumbnail.small;
     else el.removeAttribute('src');
+    // Album art is square; video thumbnails are zoomed past their letterbox bars.
+    el.classList.toggle('square', !!t?.thumbnail.square);
   });
-  $('#fullplayer').style.setProperty('--art', t ? `url("${t.thumbnail.large}")` : 'none');
+  // The background is blurred beyond recognition anyway, so the small image does: it's far cheaper to blur.
+  $('#fullplayer').style.setProperty('--art', t ? `url("${t.thumbnail.small}")` : 'none');
   document.title = t ? `${t.title} • ${t.artist}` : 'Spoti - Web Player';
   updateLikes();
   markCurrent();
   updateMediaSession(t);
+  scheduleTick();
 }
 
 function markCurrent() {
@@ -789,9 +1007,26 @@ function updateMediaSession(t) {
     ? new MediaMetadata({
         title: t.title,
         artist: t.artist,
-        artwork: [{ src: new URL(t.thumbnail.large, location.href).href, sizes: '480x360', type: 'image/jpeg' }],
+        artwork: [
+          {
+            src: new URL(t.thumbnail.large, location.href).href,
+            sizes: t.thumbnail.square ? '544x544' : '480x360',
+            type: 'image/jpeg',
+          },
+        ],
       })
     : null;
+  updatePositionState();
+}
+
+// Lets the lock screen and notification controls show the song's progress and seek within it.
+function updatePositionState() {
+  if (!navigator.mediaSession?.setPositionState) return;
+  const duration = currentDuration();
+  try {
+    if (!state.current || !duration) navigator.mediaSession.setPositionState();
+    else navigator.mediaSession.setPositionState({ duration, position: Math.min(player.currentTime, duration), playbackRate: 1 });
+  } catch {}
 }
 
 if ('mediaSession' in navigator) {
@@ -802,7 +1037,10 @@ if ('mediaSession' in navigator) {
     nexttrack: () => next(),
     seekbackward: () => seekBy(-10),
     seekforward: () => seekBy(10),
-    seekto: (d) => player.seek(d.seekTime),
+    seekto: (d) => {
+      player.seek(d.seekTime);
+      updatePositionState();
+    },
   };
   for (const [action, fn] of Object.entries(handlers)) {
     try {
@@ -814,8 +1052,10 @@ if ('mediaSession' in navigator) {
 /* ================= sliders: seek + volume ================= */
 
 function setSlider(el, p) {
-  el.style.setProperty('--p', p);
-  el.dataset.value = p;
+  const value = String(Math.round(p * 10000) / 10000);
+  if (el.dataset.value === value) return;
+  el.style.setProperty('--p', value);
+  el.dataset.value = value;
   const now = String(Math.round(p * 100));
   if (el.getAttribute('aria-valuenow') !== now) el.setAttribute('aria-valuenow', now);
 }
@@ -879,10 +1119,13 @@ progressEls.forEach((el) =>
     step: () => (currentDuration() ? 5 / currentDuration() : 0),
     onInput: (p) => {
       if (state.current) seekPreview = p * currentDuration();
+      scheduleTick();
     },
     onCommit: (p) => {
       seekPreview = null;
       if (state.current && currentDuration()) player.seek(p * currentDuration());
+      updatePositionState();
+      scheduleTick();
     },
   })
 );
@@ -920,17 +1163,43 @@ volumeEls.forEach((el) => {
 
 let lastCur = '';
 let lastDur = '';
-function tick() {
+let lastMini = '';
+function paintProgress() {
   const dur = currentDuration();
   const cur = seekPreview ?? (state.current ? Math.min(player.currentTime, dur || Infinity) : 0);
   const p = dur ? clamp01(cur / dur) : 0;
   for (const el of progressEls) if (!el.classList.contains('dragging')) setSlider(el, p);
-  miniProgress.style.setProperty('--p', p);
+  const mini = String(Math.round(p * 10000) / 10000);
+  if (mini !== lastMini) miniProgress.style.setProperty('--p', (lastMini = mini));
   const c = fmt(cur);
   const d = fmt(dur);
   if (c !== lastCur) timeCurEls.forEach((el) => (el.textContent = lastCur = c));
-  if (d !== lastDur) timeDurEls.forEach((el) => (el.textContent = lastDur = d));
+  if (d !== lastDur) {
+    timeDurEls.forEach((el) => (el.textContent = lastDur = d));
+    updatePositionState();
+  }
+}
+
+// Progress is repainted about four times a second, and only while a song plays or a seek is being
+// dragged: a 3-minute song moves the bar well under a pixel between paints.
+const PAINT_INTERVAL = 250;
+let ticking = false;
+let lastPaint = 0;
+
+function scheduleTick() {
+  if (ticking) return;
+  ticking = true;
   requestAnimationFrame(tick);
+}
+
+function tick(now) {
+  ticking = false;
+  const live = player.state === State.PLAYING || seekPreview != null;
+  if (!live || seekPreview != null || now - lastPaint >= PAINT_INTERVAL) {
+    paintProgress();
+    lastPaint = now;
+  }
+  if (live) scheduleTick();
 }
 
 /* ================= menu + toast ================= */
@@ -1008,10 +1277,8 @@ function handleAction(name, el) {
       return prev();
     case 'shuffle':
       state.shuffle = !state.shuffle;
-      if (state.shuffle) {
-        shuffleInPlace(state.context.tracks);
-        shuffleInPlace(state.autoplay);
-      }
+      // Like Spotify, shuffle reorders the list you're playing, never autoplay's radio-style mix.
+      if (state.shuffle) shuffleInPlace(state.context.tracks);
       store.set('shuffle', state.shuffle);
       updateModes();
       renderQueue();
@@ -1267,11 +1534,58 @@ function route() {
 
 window.addEventListener('hashchange', route);
 
+/* ================= saved session ================= */
+
+// What's playing and lined up is saved in the browser, so a reload carries on where you left off.
+let persistTimer;
+function persistSession() {
+  clearTimeout(persistTimer);
+  persistTimer = setTimeout(saveSession, 1000);
+}
+
+function saveSession() {
+  clearTimeout(persistTimer);
+  if (!state.current) return store.set('session', null);
+  const st = state.station;
+  store.set('session', {
+    current: { track: state.current.track, source: state.current.source },
+    position: player.currentTime,
+    queue: state.queue,
+    context: { name: state.context.name, tracks: state.context.tracks.slice(0, 500) },
+    autoplay: state.autoplay.slice(0, 100),
+    station: { ...st, anchors: st.anchors.slice(0, 50), loved: st.loved.slice(-20) },
+    // So autoplay doesn't repeat what this session already played.
+    played: [...state.played].slice(-300),
+    playedTitles: [...state.playedTitles].slice(-300),
+  });
+}
+
+// Restores the saved session paused, at the position it was left at.
+function restoreSession() {
+  const saved = store.get('session', null);
+  if (!saved?.current?.track?.id) return;
+  state.current = saved.current;
+  state.queue.push(...(saved.queue || []));
+  if (saved.context?.tracks) state.context = saved.context;
+  state.autoplay.push(...(saved.autoplay || []));
+  state.station = { ...newStation([]), ...saved.station };
+  for (const id of saved.played || []) state.played.add(id);
+  for (const key of saved.playedTitles || []) state.playedTitles.add(key);
+  runSeq = Math.max(runSeq, ...state.autoplay.map((t) => t.run || 0));
+  player.cue(state.current.track.id, saved.position || 0);
+}
+
+window.addEventListener('pagehide', saveSession);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') saveSession();
+});
+
 /* ================= boot ================= */
 
+restoreSession();
 renderLibrary();
 route();
 applyVolume();
 updateModes();
 updateNowPlaying();
-requestAnimationFrame(tick);
+ensureRadio();

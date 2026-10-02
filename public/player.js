@@ -51,14 +51,19 @@ export class HiddenPlayer extends EventTarget {
     return this.state === State.PLAYING || this.state === State.BUFFERING;
   }
 
-  load(videoId, start = 0) {
+  load(videoId, start = 0, { autoplay = true } = {}) {
     this.videoId = videoId;
     this.duration = 0;
     this.#time = start;
     this.#stamp = this.#loadedAt = performance.now();
-    this.#wantPlay = true;
-    if (!this.#iframe) return this.#create(videoId);
-    this.#command('loadVideoById', [videoId, start, 'tiny']);
+    this.#wantPlay = autoplay;
+    if (!this.#iframe) return this.#create(videoId, start);
+    this.#command(autoplay ? 'loadVideoById' : 'cueVideoById', [videoId, start, 'tiny']);
+  }
+
+  // Loads a video paused at `start`, ready for play().
+  cue(videoId, start = 0) {
+    this.load(videoId, start, { autoplay: false });
   }
 
   play() {
@@ -88,10 +93,11 @@ export class HiddenPlayer extends EventTarget {
     this.#command(muted ? 'mute' : 'unMute');
   }
 
-  #create(videoId) {
+  #create(videoId, start) {
     const params = new URLSearchParams({
       enablejsapi: '1',
-      autoplay: '1',
+      autoplay: this.#wantPlay ? '1' : '0',
+      start: String(Math.floor(start)),
       controls: '0',
       disablekb: '1',
       fs: '0',
@@ -182,7 +188,8 @@ export class HiddenPlayer extends EventTarget {
     // Right after switching videos the embed can still report the previous one's clock.
     const fresh = reportedId ? reportedId === this.videoId : performance.now() - this.#loadedAt > 1000;
     if (fresh) {
-      if (typeof info.currentTime === 'number') {
+      // A cued video reports 0 until it plays, which would hide the position it was cued at.
+      if (typeof info.currentTime === 'number' && (this.#wantPlay || info.currentTime > 0)) {
         this.#time = info.currentTime;
         this.#stamp = performance.now();
         this.dispatchEvent(new Event('timeupdate'));

@@ -6,7 +6,14 @@ A Spotify-style web player. Search results come from YouTube, and songs play thr
 
 - **Search**: YouTube search with suggestions as you type, a top result, and more results that load as you scroll.
 - **Queue**: *Play*, *Add to queue*, *Play next*, and removing or jumping to songs in the queue panel.
-- **Autoplay**: when your queue runs out, related songs keep playing, like Spotify's radio. They come from YouTube Music: the artist's "Fans might also like" artists, two top songs from each, mixed with the artist's own hits. When recommendations run out, a new radio starts from whatever is playing, so the music drifts naturally. If YouTube Music can't be reached from the server, Deezer's artist radio is used as a backup.
+- **Autoplay**: when your queue runs out, related songs keep playing, like Spotify's radio. They come from YouTube Music: top songs from the artist's "Fans might also like" artists and a few artists further out, mixed with the artist's own hits. Like Spotify:
+  - it's ordered like a radio station: sometimes a short run of 2–3 songs by one artist, but an artist never comes back within 3 songs by accident, and shuffle doesn't scramble it;
+  - it stays close to what you started from: refills alternate between the song (or playlist) you started with and songs you've since played to the end or saved;
+  - it learns: skipping a recommendation in its first 30 seconds means less of that artist (none after a second skip), and finishing songs or saving them counts for the artist, remembered between visits;
+  - it mixes in your Liked Songs now and then, when their artist is part of the mix.
+
+  If YouTube Music can't be reached from the server, Deezer's artist radio is used as a backup.
+- **Picks up where you left off**: what's playing, the queue and Next up are saved in the browser and restored (paused) on reload.
 - **Controls**: play/pause, seek (drag or arrow keys), next/previous, shuffle, repeat song, volume and mute.
 - **Library**: Liked Songs, saved in the browser's localStorage.
 - **Mobile layout**: a mini player plus a full-screen player.

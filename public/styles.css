@@ -302,10 +302,12 @@ body.is-playing .pp.global .ic-pause, body.is-playing .is-current .pp .ic-pause 
 .slider { --p: 0; flex: 1; position: relative; height: 16px; display: flex; align-items: center; cursor: pointer; touch-action: none; }
 .slider:focus-visible { outline-offset: 4px; border-radius: 4px; }
 .slider .track { width: 100%; height: 4px; background: #4d4d4d; border-radius: 2px; overflow: hidden; }
-.slider .fill { height: 100%; width: calc(var(--p) * 100%); background: #fff; border-radius: 2px; }
-.slider .knob { position: absolute; left: calc(var(--p) * 100%); width: 12px; height: 12px; margin-left: -6px; border-radius: 50%; background: #fff; box-shadow: 0 2px 4px rgba(0, 0, 0, .5); opacity: 0; }
+/* Fills scale instead of resizing, so moving them never triggers layout. */
+.slider .fill { height: 100%; width: 100%; transform: scaleX(var(--p)); transform-origin: left; background: #fff; }
+/* The knob only exists while shown (hover, drag, focus), so it costs no layout the rest of the time. */
+.slider .knob { display: none; position: absolute; left: calc(var(--p) * 100%); width: 12px; height: 12px; margin-left: -6px; border-radius: 50%; background: #fff; box-shadow: 0 2px 4px rgba(0, 0, 0, .5); }
 .slider:hover .fill, .slider.dragging .fill, .slider:focus-visible .fill { background: var(--accent); }
-.slider:hover .knob, .slider.dragging .knob, .slider:focus-visible .knob { opacity: 1; }
+.slider:hover .knob, .slider.dragging .knob, .slider:focus-visible .knob { display: block; }
 
 .extras { display: flex; align-items: center; justify-content: flex-end; gap: 6px; padding-right: 8px; }
 .volume { flex: 0 1 110px; }
@@ -351,13 +353,14 @@ body[data-vol="high"] .vol-btn .ic-volHigh { display: block; }
 .fp-art-wrap { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; }
 .fp-art-box { width: min(100%, 52vh); aspect-ratio: 1; border-radius: 8px; overflow: hidden; box-shadow: 0 16px 48px rgba(0, 0, 0, .6); background: #282828; }
 .art-hq { width: 100%; height: 100%; object-fit: cover; transform: scale(1.34); }
+.art-hq.square { transform: none; }
 .fp-meta { display: flex; align-items: center; gap: 12px; }
 .fp-text { flex: 1; min-width: 0; }
 .fp-title { font-size: 22px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .fp-artist { color: var(--sub); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .fp-meta .ic { width: 26px; height: 26px; }
 .fullplayer > .slider { flex: none; height: 20px; }
-.fullplayer .slider .knob { opacity: 1; }
+.fullplayer .slider .knob { display: block; }
 .fp-times { display: flex; justify-content: space-between; font-size: 12px; color: var(--sub); margin-top: -12px; font-variant-numeric: tabular-nums; }
 .fp-controls { display: flex; align-items: center; justify-content: space-between; }
 .fp-controls .ctrl { width: 44px; height: 44px; color: var(--text); }
@@ -410,7 +413,7 @@ body[data-vol="high"] .vol-btn .ic-volHigh { display: block; }
   .mini-actions .ic { width: 24px; height: 24px; }
   .mini-toggle { color: var(--text); width: 40px; height: 40px; }
   .mini-progress { display: block; position: absolute; left: 8px; right: 8px; bottom: 0; height: 2px; background: rgba(255, 255, 255, .2); --p: 0; }
-  .mini-progress::after { content: ''; display: block; height: 100%; width: calc(var(--p) * 100%); background: #fff; }
+  .mini-progress::after { content: ''; display: block; height: 100%; width: 100%; transform: scaleX(var(--p)); transform-origin: left; background: #fff; }
 
   .mobile-nav {
     display: flex; justify-content: space-around;

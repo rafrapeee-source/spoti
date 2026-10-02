@@ -1,6 +1,8 @@
 import express from 'express';
 import compression from 'compression';
 import path from 'node:path';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -39,21 +41,31 @@ let visitorData = null;
 const VIDEO_FILTER = 'EgIQAQ%3D%3D';
 
 /* ---------------- tiny TTL cache ---------------- */
+// Holds parsed results only (never whole YouTube responses), so entries stay a few KB each.
 const cache = new Map();
 const CACHE_TTL = 10 * 60 * 1000;
-const CACHE_MAX = 500;
+const CACHE_MAX = 2000;
 
-function cached(key, fn) {
+function cached(key, fn, ttl = CACHE_TTL) {
   const hit = cache.get(key);
-  if (hit && hit.expires > Date.now()) return hit.value;
+  if (hit && hit.expires > Date.now()) {
+    // Re-inserting keeps the map in least-recently-used order, so eviction drops the stalest entry.
+    cache.delete(key);
+    cache.set(key, hit);
+    return hit.value;
+  }
   const value = fn().catch((err) => {
     cache.delete(key);
     throw err;
   });
-  cache.set(key, { value, expires: Date.now() + CACHE_TTL });
+  cache.set(key, { value, expires: Date.now() + ttl });
   if (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value);
   return value;
 }
+
+// A song or artist YouTube has nothing for. Unlike a refused or failed request, it says nothing
+// about whether the source works.
+class NoMatch extends Error {}
 
 async function innertube(endpoint, body, { kind = 'web', timeout = 12000 } = {}) {
   const { url, client, headers } = CLIENTS[kind];
@@ -82,7 +94,10 @@ async function innertube(endpoint, body, { kind = 'web', timeout = 12000 } = {})
       const title = raw.match(/<title>([^<]*)<\/title>/i)?.[1];
       if (title) reason = /^sorry/i.test(title) ? 'blocked by Google bot check' : title;
     }
-    throw new Error(`${kind} ${endpoint} HTTP ${res.status}${reason ? `: ${reason}` : ''}`);
+    const err = new Error(`${kind} ${endpoint} HTTP ${res.status}${reason ? `: ${reason}` : ''}`);
+    err.status = res.status;
+    err.blocked = res.status === 403 || res.status === 429 || reason === 'blocked by Google bot check';
+    throw err;
   }
 }
 
@@ -263,8 +278,18 @@ const YTMUSIC_TIMEOUT = 8000;
 // "The Weeknd • After Hours • 2020" -> "The Weeknd"
 const firstPart = (s) => String(s || '').split(' • ')[0].trim();
 
+// Album art from YouTube Music (square, unlike video thumbnails), proxied like thumbnails are.
+// Music videos' rows carry no album art, so they keep the video thumbnail.
+function musicArt(node, videoId) {
+  const url = collect(node, 'thumbnails').flat().at(-1)?.url || '';
+  const src = url.match(/^https:\/\/lh3\.googleusercontent\.com\/([\w\-/.]+?)(=[\w-]*)?$/)?.[1];
+  if (!src || src.includes('..')) return thumb(videoId);
+  const q = encodeURIComponent(src);
+  return { small: `/api/art/${videoId}?src=${q}`, large: `/api/art/${videoId}?src=${q}&size=hq`, square: true };
+}
+
 // YouTube Music already separates title and artist, so no "Artist - Title" parsing is needed.
-function musicTrack({ videoId, title, artist, durationText = '' }) {
+function musicTrack({ videoId, title, artist, durationText = '', thumbnail }) {
   if (!videoId || !title) return null;
   return {
     id: videoId,
@@ -274,7 +299,7 @@ function musicTrack({ videoId, title, artist, durationText = '' }) {
     channel: artist,
     duration: parseDuration(durationText),
     durationText,
-    thumbnail: thumb(videoId),
+    thumbnail: thumbnail || thumb(videoId),
   };
 }
 
@@ -310,23 +335,22 @@ function artistLinks(node) {
   return out;
 }
 
-const ytmusicBrowse = (browseId) =>
-  cached(`ytm:b:${browseId}`, () => innertube('browse', { browseId }, { kind: 'music', timeout: YTMUSIC_TIMEOUT }));
-
 // A song row in a YouTube Music list, such as an artist page's top songs.
 function fromMusicListItem(r, fallbackArtist = '') {
+  const videoId = r.playlistItemData?.videoId || collect(r, 'watchEndpoint')[0]?.videoId;
   const columns = (r.flexColumns || []).map((c) => text(c.musicResponsiveListItemFlexColumnRenderer?.text));
   // The second column is "Artist • Album", sometimes prefixed with the item type ("Song • Artist").
   const parts = String(columns[1] || '').split(' • ');
   const byline = (/^(song|video|single|ep)$/i.test(parts[0]) ? parts[1] : parts[0])?.trim();
   return musicTrack({
-    videoId: r.playlistItemData?.videoId || collect(r, 'watchEndpoint')[0]?.videoId,
+    videoId,
     title: columns[0],
     artist: byline && !/\b(plays|views)\b/i.test(byline) ? byline : fallbackArtist,
     durationText:
       (r.fixedColumns || [])
         .map((c) => text(c.musicResponsiveListItemFixedColumnRenderer?.text))
         .find((t) => /^\d+(:\d{2})+$/.test(t)) || '',
+    thumbnail: videoId && musicArt(r.thumbnail, videoId),
   });
 }
 
@@ -373,46 +397,89 @@ function radioOrder({ opening, own, near, far }) {
   return order.flat();
 }
 
+// Artist pages and search matches change rarely, so they're kept for hours. Only the parts autoplay
+// uses are cached: whole artist pages run to hundreds of KB each.
+const ARTIST_TTL = 6 * 60 * 60 * 1000;
+const WIDER_ARTISTS = 5;
+// Wider-genre songs only play in the second half of a mix, so slow pages aren't waited for long.
+const WIDER_WAIT = 1500;
+
+const artistInfo = (browseId, name) =>
+  cached(
+    `ytm:a:${browseId}`,
+    async () => {
+      const page = await innertube('browse', { browseId }, { kind: 'music', timeout: YTMUSIC_TIMEOUT });
+      const info = { songs: topSongs(page, name), similar: similarArtists(page), shape: shapeOf(page) };
+      if (!info.songs.length && !info.similar.length) throw new NoMatch(`nothing usable on ${name}'s page`);
+      return info;
+    },
+    ARTIST_TTL
+  );
+
+const findArtist = (query, artistKey) =>
+  cached(
+    `ytm:s:${query}`,
+    async () => {
+      const results = await innertube('search', { query }, { kind: 'music', timeout: YTMUSIC_TIMEOUT });
+      const links = artistLinks(results);
+      const artist =
+        links.find((a) => {
+          const name = norm(a.name);
+          return artistKey && name && (name.includes(artistKey) || artistKey.includes(name));
+        }) || links[0];
+      if (!artist) throw new NoMatch('artist not found on YouTube Music');
+      return { artist, shape: shapeOf(results) };
+    },
+    ARTIST_TTL
+  );
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 // Autoplay recommendations from YouTube Music, built like Spotify's radio from the artist's
 // "Fans might also like" list: one song from each similar artist, a few of the artist's own songs,
 // and one song each from artists similar to those, to reach the wider genre. (YouTube Music's song
 // radio and song-based Related tab would be better, but Google blocks the request they need from
 // cloud servers, for the website and the phone app clients alike.)
-async function ytmusicArtistRadio(videoId, seed, trace) {
+// `variant` > 0 asks for another mix from a seed used before: it reaches further down the
+// "Fans might also like" list, so later refills from the same song don't repeat the first.
+async function ytmusicArtistRadio(videoId, seed, { variant = 0, trace } = {}) {
   const query = `${stripExtras(seed.artist)} ${stripExtras(seed.title)}`.trim();
-  if (!query) throw new Error('no artist or title to search for');
-  const results = await cached(`ytm:s:${query}`, () =>
-    innertube('search', { query }, { kind: 'music', timeout: YTMUSIC_TIMEOUT })
-  );
-  trace?.push({ step: 'search', shape: shapeOf(results) });
+  if (!query) throw new NoMatch('no artist or title to search for');
+  const { artist, shape } = await findArtist(query, norm(stripExtras(seed.artist)));
+  trace?.push({ step: 'search', artist: artist.name, shape });
 
-  const artistKey = norm(stripExtras(seed.artist));
-  const links = artistLinks(results);
-  const artist =
-    links.find((a) => {
-      const name = norm(a.name);
-      return artistKey && name && (name.includes(artistKey) || artistKey.includes(name));
-    }) || links[0];
-  if (!artist) throw new Error('artist not found on YouTube Music');
-
-  const page = await ytmusicBrowse(artist.browseId);
-  trace?.push({ step: `artist page: ${artist.name}`, shape: shapeOf(page) });
+  const page = await artistInfo(artist.browseId, artist.name);
+  trace?.push({ step: `artist page: ${artist.name}`, shape: page.shape });
 
   // Skips the playing song, other versions of it, and covers, remixes or sped-up edits.
   const usable = (songs) => songs.filter((t) => t.id !== videoId && !VARIANT.test(t.title) && !sameSong(t, seed));
 
-  const similar = similarArtists(page).filter((a) => a.browseId !== artist.browseId).slice(0, 10);
-  const similarPages = await mapLimit(similar, 5, (a) => ytmusicBrowse(a.browseId).catch(() => null));
+  const candidates = page.similar.filter((a) => a.browseId !== artist.browseId);
+  const similar = variant ? shuffled(candidates.slice(0, 16)).slice(0, 10) : candidates.slice(0, 10);
 
-  // Artists similar to the similar artists, taken from their own "Fans might also like" lists,
-  // which came with the pages loaded above.
+  // All similar artists' pages are requested at once. As each arrives, one artist from its own
+  // "Fans might also like" list is picked to reach the wider genre, and requested straight away.
   const known = new Set([artist.browseId, ...similar.map((a) => a.browseId)]);
-  const wider = new Map();
-  for (const p of similarPages) {
-    for (const a of p ? similarArtists(p) : []) if (!known.has(a.browseId)) wider.set(a.browseId, a);
-  }
-  const widerArtists = shuffled([...wider.values()]).slice(0, 5);
-  const widerPages = await mapLimit(widerArtists, 5, (a) => ytmusicBrowse(a.browseId).catch(() => null));
+  const widerArtists = [];
+  const widerPages = [];
+  const widerLoads = [];
+  const similarPages = await Promise.all(
+    similar.map((a) =>
+      artistInfo(a.browseId, a.name).then(
+        (p) => {
+          const pick = shuffled(p.similar).find((w) => !known.has(w.browseId));
+          if (pick && widerArtists.length < WIDER_ARTISTS) {
+            known.add(pick.browseId);
+            const i = widerArtists.push(pick) - 1;
+            widerLoads.push(artistInfo(pick.browseId, pick.name).then((w) => (widerPages[i] = w), () => {}));
+          }
+          return p;
+        },
+        () => null
+      )
+    )
+  );
+  await Promise.race([Promise.all(widerLoads), delay(WIDER_WAIT)]);
 
   // Drops repeats: the same video, or the same song uploaded twice by the same artist.
   const seen = new Set();
@@ -424,9 +491,9 @@ async function ytmusicArtistRadio(videoId, seed, trace) {
     return true;
   };
   // Up to `count` songs by one artist, picked at random from their six most popular.
-  const songsBy = (artistPage, a, count) => {
+  const songsBy = (artistPage, count) => {
     const picked = [];
-    for (const t of artistPage ? shuffled(usable(topSongs(artistPage, a.name)).slice(0, 6)) : []) {
+    for (const t of artistPage ? shuffled(usable(artistPage.songs).slice(0, 6)) : []) {
       if (picked.length === count) break;
       if (fresh(t)) picked.push(t);
     }
@@ -436,15 +503,15 @@ async function ytmusicArtistRadio(videoId, seed, trace) {
   // Like Spotify, autoplay sometimes stays with an artist before moving on: it opens with 0-3 more
   // songs by the original artist (usually 1-2), and about a third of similar artists get two songs.
   const openingLength = [0, 1, 1, 2, 2, 3][Math.floor(Math.random() * 6)];
-  const ownSongs = songsBy(page, artist, 5);
+  const ownSongs = songsBy(page, 5);
   const opening = ownSongs.splice(0, openingLength);
   const own = ownSongs.slice(0, 2);
-  const near = similar.map((a, i) => songsBy(similarPages[i], a, Math.random() < 0.3 ? 2 : 1)).filter((b) => b.length);
-  const far = widerArtists.map((a, i) => songsBy(widerPages[i], a, 1)).filter((b) => b.length);
+  const near = similarPages.map((p) => songsBy(p, Math.random() < 0.3 ? 2 : 1)).filter((b) => b.length);
+  const far = widerArtists.map((_, i) => songsBy(widerPages[i], 1)).filter((b) => b.length);
   trace?.push({
     step: 'mix',
     similar: similar.map((a) => a.name),
-    widerGenre: widerArtists.map((a) => a.name),
+    widerGenre: widerArtists.map((a, i) => (widerPages[i] ? a.name : `${a.name} (too slow, left out)`)),
     songs: { opening: opening.length, ownLater: own.length, similar: near.flat().length, wider: far.flat().length },
   });
   return radioOrder({ opening, own, near, far });
@@ -452,21 +519,34 @@ async function ytmusicArtistRadio(videoId, seed, trace) {
 
 const YTMUSIC_SOURCES = [['ytmusic-artists', ytmusicArtistRadio]];
 
-async function ytmusic(videoId, seed) {
-  const { tracks, source, failures } = await firstWorking(YTMUSIC_SOURCES, videoId, seed);
+async function ytmusic(videoId, seed, options) {
+  const { tracks, source, failures } = await firstWorking(YTMUSIC_SOURCES, videoId, seed, options);
   if (!source) throw new Error(failures.join(' | '));
   return { tracks, source };
 }
 
 /* ---------------- autoplay sources ---------------- */
 
-// A source YouTube refuses from this server is skipped for a while, so later lookups
-// go straight to what works instead of waiting on requests that will fail again.
+// A source YouTube refuses from this server (403, 429 or its bot check) is skipped for a while, so
+// later lookups go straight to what works instead of waiting on requests that will fail again.
+// Timeouts and server errors only count after two in a row, and a song YouTube has nothing for
+// never does: one obscure song mustn't switch recommendations off for everyone.
 const SOURCE_COOLDOWN = 15 * 60 * 1000;
 const sourceCooldown = new Map();
+const sourceFailStreak = new Map();
+
+function noteFailure(source, err) {
+  if (err instanceof NoMatch) return;
+  const streak = (sourceFailStreak.get(source) || 0) + 1;
+  sourceFailStreak.set(source, streak);
+  if (!err.blocked && streak < 2) return;
+  sourceFailStreak.delete(source);
+  sourceCooldown.set(source, Date.now() + SOURCE_COOLDOWN);
+  console.warn(`[autoplay] ${source} unavailable for 15 min: ${err.message}`);
+}
 
 // Tries sources in order and returns the first one with at least 3 songs.
-async function firstWorking(sources, videoId, seed) {
+async function firstWorking(sources, videoId, seed, options) {
   const failures = [];
   for (const [source, run] of sources) {
     if ((sourceCooldown.get(source) || 0) > Date.now()) {
@@ -474,12 +554,12 @@ async function firstWorking(sources, videoId, seed) {
       continue;
     }
     try {
-      const tracks = await run(videoId, seed);
+      const tracks = await run(videoId, seed, options);
+      sourceFailStreak.delete(source);
       if (tracks.length >= 3) return { tracks, source, failures };
       failures.push(`${source}: only ${tracks.length} songs`);
     } catch (err) {
-      sourceCooldown.set(source, Date.now() + SOURCE_COOLDOWN);
-      console.warn(`[autoplay] ${source} unavailable for 15 min: ${err.message}`);
+      noteFailure(source, err);
       failures.push(`${source}: ${err.message}`);
     }
   }
@@ -545,13 +625,15 @@ app.get(
   })
 );
 
-// Recommendations from YouTube Music artist pages, used first by the browser's autoplay.
+// Recommendations from YouTube Music artist pages, used first by the browser's autoplay. Not cached
+// as a whole: every call is a new random mix, and the artist pages it's built from are cached.
 app.get(
   '/api/ytmusic/radio',
   wrap(async (req) => {
     const id = String(req.query.id || '');
     if (!/^[\w-]{11}$/.test(id)) return { tracks: [] };
-    return cached(`ytm:r:${id}`, () => ytmusic(id, seedFrom(req)));
+    const variant = Math.min(9, Math.max(0, Number.parseInt(req.query.v, 10) || 0));
+    return ytmusic(id, seedFrom(req), { variant });
   })
 );
 
@@ -584,7 +666,7 @@ app.get('/api/debug/radio', async (req, res) => {
     const started = Date.now();
     const trace = [];
     try {
-      const tracks = await run(id, seed, trace);
+      const tracks = await run(id, seed, { trace });
       report.push({
         source,
         ok: true,
@@ -612,22 +694,49 @@ app.get(
   })
 );
 
-app.get('/api/thumb/:id', async (req, res) => {
+// Streams the first image that loads, so the server never holds a whole image in memory.
+async function sendImage(res, urls) {
+  let status = 502;
+  for (const url of urls) {
+    try {
+      const upstream = await fetch(url, { signal: AbortSignal.timeout(10000) });
+      if (!upstream.ok || !upstream.body) {
+        status = upstream.status;
+        continue;
+      }
+      res.set({
+        'Content-Type': upstream.headers.get('content-type') || 'image/jpeg',
+        'Cache-Control': 'public, max-age=604800, immutable',
+      });
+      await pipeline(Readable.fromWeb(upstream.body), res);
+      return;
+    } catch (err) {
+      if (res.headersSent) return res.destroy();
+      console.error('[image]', err.message);
+    }
+  }
+  res.status(status).end();
+}
+
+app.get('/api/thumb/:id', (req, res) => {
   const { id } = req.params;
   if (!/^[\w-]{11}$/.test(id)) return res.status(400).end();
   const file = req.query.size === 'hq' ? 'hqdefault.jpg' : 'mqdefault.jpg';
-  try {
-    const upstream = await fetch(`https://i.ytimg.com/vi/${id}/${file}`);
-    if (!upstream.ok) return res.status(upstream.status).end();
-    res.set({
-      'Content-Type': upstream.headers.get('content-type') || 'image/jpeg',
-      'Cache-Control': 'public, max-age=604800, immutable',
-    });
-    res.send(Buffer.from(await upstream.arrayBuffer()));
-  } catch (err) {
-    console.error('[thumb]', err.message);
-    res.status(502).end();
+  sendImage(res, [`https://i.ytimg.com/vi/${id}/${file}`]);
+});
+
+// YouTube Music album art, falling back to the video thumbnail. Only lh3.googleusercontent.com
+// images can be requested, so this is not an open proxy.
+app.get('/api/art/:id', (req, res) => {
+  const { id } = req.params;
+  const src = String(req.query.src || '');
+  if (!/^[\w-]{11}$/.test(id)) return res.status(400).end();
+  const size = req.query.size === 'hq' ? 544 : 120;
+  const urls = [`https://i.ytimg.com/vi/${id}/mqdefault.jpg`];
+  if (/^[\w\-/.]{1,400}$/.test(src) && !src.includes('..')) {
+    urls.unshift(`https://lh3.googleusercontent.com/${src}=w${size}-h${size}-l90-rj`);
   }
+  sendImage(res, urls);
 });
 
 app.get('/healthz',(_req, res) => res.send('ok'));
