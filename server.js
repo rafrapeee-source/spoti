@@ -313,7 +313,13 @@ app.get('/api/art/:id', (req, res) => {
 app.get('/healthz', (_req, res) => res.send('ok'));
 app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found' }));
 
-app.use(express.static(path.join(__dirname, 'public'), { maxAge: '1h' }));
+// The page itself is always checked for updates, so a fresh script never runs against an old page.
+app.use(
+  express.static(path.join(__dirname, 'public'), {
+    maxAge: '1h',
+    setHeaders: (res, file) => file.endsWith('.html') && res.setHeader('Cache-Control', 'no-cache'),
+  })
+);
 app.get('*', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
 app.listen(PORT, () => console.log(`Spoti listening on http://localhost:${PORT}`));

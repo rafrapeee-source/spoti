@@ -13,17 +13,22 @@ A Spotify-style web player. Everything you see (songs, artists, albums, charts, 
   - it stays close to what you started from: refills alternate between the song (or list) you started with and songs you've since played to the end or saved;
   - it learns: skipping a recommendation in its first 30 seconds means less of that artist (none after a second skip), and finishing songs or saving them counts for the artist, remembered between visits;
   - it mixes in your Liked Songs now and then, when their artist is part of the mix.
+- **Lyrics**, synced like Spotify's: press the microphone button (or `L`) and the line being sung lights up word by word as the view follows along. Tap a line to jump there. Instrumental breaks show three dots that fill until the singing comes back. The background takes its colour from the album art, and if you scroll away, the view returns to the current line after a few seconds (or right away with *Back to current line*).
+  - **Sync**: if a song's YouTube upload has an intro the album version doesn't, its lyrics run late. *−* and *+* move them a quarter second at a time, and the setting is remembered for that upload. When the upload's length is noticeably different from the song's, the lyrics say so.
+  - Lyrics come from [LRCLIB](https://lrclib.net), a free lyrics library. It times each line; for the few songs where it also times each word, those timings are used, and otherwise each word's timing is estimated from its syllables. Songs with only plain lyrics show them unsynced. Lyrics are kept in the browser, and the next song's are fetched ahead while the lyrics are open.
 - **Picks up where you left off**: what's playing, the queue and Next up are saved in the browser and restored (paused) on reload.
 - **Controls**: play/pause, seek (drag or arrow keys), next/previous, shuffle, repeat song, volume and mute.
 - **Library**: Liked Songs, saved in the browser's localStorage.
 - **Mobile layout**: a mini player plus a full-screen player.
-- **Keyboard shortcuts**: `Space` play/pause, `←`/`→` seek 5 seconds, `M` mute, `/` or `Ctrl+K` search.
+- **Keyboard shortcuts**: `Space` play/pause, `←`/`→` seek 5 seconds, `M` mute, `L` lyrics, `/` or `Ctrl+K` search.
 
 ## How it works
 
 ```
 Browser ──► Deezer API, via JSONP (search, artists, albums, charts, recommendations)
    │        + Deezer's image CDN (cover art, artist photos)
+   │
+   ├──► lrclib.net (lyrics, called from the browser)
    │
    ├──► Render (server.js) ──► YouTube search (finds each song's upload)
    │

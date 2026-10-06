@@ -1,5 +1,6 @@
 import { HiddenPlayer, State } from './player.js';
 import * as dz from './deezer.js';
+import { LyricsView, prefetchLyrics } from './lyrics.js';
 
 /* ================= helpers ================= */
 
@@ -108,6 +109,7 @@ const ICONS = {
   artist: `<circle ${S} cx="12" cy="8" r="4"/><path ${S} d="M4 21a8 8 0 0 1 16 0"/>`,
   album: `<circle ${S} cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.4"/>`,
   chart: `<path ${S} d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>`,
+  lyrics: `<rect ${S} x="9" y="2.5" width="6" height="11.5" rx="3"/><path ${S} d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5v4M8.5 21.5h7"/>`,
 };
 const icon = Object.fromEntries(
   Object.entries(ICONS).map(([name, body]) => [
@@ -245,6 +247,8 @@ function resolveVideo(track, { exclude = [] } = {}) {
 function prefetchNext() {
   const upcoming = [state.queue[0], state.context.tracks[0], state.autoplay[0]].find(Boolean);
   if (upcoming) resolveVideo(upcoming).catch(() => {});
+  // With lyrics open, the next song's are ready the moment it starts.
+  if (upcoming && lyrics.isOpen) prefetchLyrics(upcoming);
 }
 
 function startTrack(entry, { pushHistory = true } = {}) {
@@ -1119,6 +1123,30 @@ function toggleQueue(force) {
   if (open) renderQueue();
 }
 
+/* ---------- lyrics ---------- */
+
+const lyrics = new LyricsView($('#lyrics'), {
+  time: () => (state.current?.videoId ? player.currentTime : 0),
+  duration: () => (state.current?.videoId ? player.duration : 0),
+  videoId: () => state.current?.videoId,
+  seek: (seconds) => {
+    player.seek(seconds);
+    player.play();
+    updatePositionState();
+    scheduleTick();
+  },
+});
+
+function toggleLyrics(force) {
+  const open = force ?? !lyrics.isOpen;
+  if (open === lyrics.isOpen) return;
+  document.body.classList.toggle('lyrics-open', open);
+  $('#lyrics').hidden = !open;
+  $$('[data-action="lyrics"]').forEach((b) => b.classList.toggle('on', open));
+  lyrics.setOpen(open);
+  if (open) prefetchNext();
+}
+
 function updateNowPlaying() {
   const t = state.current?.track;
   document.body.classList.toggle('has-track', !!t);
@@ -1136,6 +1164,7 @@ function updateNowPlaying() {
   updateLikes();
   markCurrent();
   updateMediaSession(t);
+  lyrics.setTrack(t);
   scheduleTick();
 }
 
@@ -1463,6 +1492,10 @@ function handleAction(name, el) {
       return toggleQueue();
     case 'close-queue':
       return toggleQueue(false);
+    case 'lyrics':
+      return toggleLyrics();
+    case 'close-lyrics':
+      return toggleLyrics(false);
     case 'clear-queue':
       state.queue.length = 0;
       return renderQueue();
@@ -1537,8 +1570,8 @@ document.addEventListener('click', (e) => {
     return handleAction(actionEl.dataset.action, actionEl);
   }
 
-  // Links (an artist's name in a row, say) only navigate.
-  if (e.target.closest('a[href]')) return;
+  // Links (an artist's name in a row, say) only navigate, away from the lyrics too.
+  if (e.target.closest('a[href]')) return toggleLyrics(false);
 
   const ref = trackRef(e.target);
   const actEl = e.target.closest('[data-act]');
@@ -1588,6 +1621,8 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     closeMenu();
     hideSuggestions();
+    // One layer at a time: the lyrics first, then the full player and queue.
+    if (lyrics.isOpen) return toggleLyrics(false);
     $('#fullplayer').hidden = true;
     if (isMobile()) toggleQueue(false);
     return;
@@ -1614,6 +1649,9 @@ document.addEventListener('keydown', (e) => {
     case 'm':
     case 'M':
       return toggleMute();
+    case 'l':
+    case 'L':
+      return toggleLyrics();
   }
 });
 
@@ -1742,6 +1780,7 @@ function route() {
   scrollObserver?.disconnect();
   hideSuggestions();
   closeMenu();
+  toggleLyrics(false);
   main.scrollTop = 0;
 
   if (name === 'search') {
